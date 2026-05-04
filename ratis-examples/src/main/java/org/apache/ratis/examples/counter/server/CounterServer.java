@@ -17,10 +17,12 @@
  */
 package org.apache.ratis.examples.counter.server;
 
+import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.common.Constants;
-import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
@@ -66,8 +68,10 @@ public final class CounterServer implements Closeable {
 
     //set the port (different for each peer) in RaftProperty object
     final int port = NetUtils.createSocketAddr(peer.getAddress()).getPort();
-    GrpcConfigKeys.Server.setPort(properties, port);
-
+    RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
+    NettyConfigKeys.Server.setPort(properties, port);
+    
+    
     //create the counter state machine which holds the counter value
     final CounterStateMachine counterStateMachine = new CounterStateMachine(simulatedSlowness);
 

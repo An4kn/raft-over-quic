@@ -21,3 +21,18 @@ patchprocess
 dependency-reduced-pom.xml
 .mvn/wrapper/maven-wrapper.jar
 .vscode/
+# Ratis generated files
+**/in_use.lock
+**/log_0-0
+**/log_inprogress_*
+**/raft-meta
+**/raft-meta.conf
+
+# Java compiled
+target/
+*.class
+*.jar
+
+# IDE
+.idea/
+*.iml

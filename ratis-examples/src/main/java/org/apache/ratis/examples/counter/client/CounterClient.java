@@ -17,6 +17,7 @@
  */
 package org.apache.ratis.examples.counter.client;
 
+import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.common.Constants;
@@ -24,6 +25,7 @@ import org.apache.ratis.examples.counter.CounterCommand;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.util.ConcurrentUtils;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.Preconditions;
@@ -67,8 +69,11 @@ public final class CounterClient implements Closeable {
 
   //build the client
   static RaftClient newClient() {
+    final RaftProperties properties = new RaftProperties();
+    RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
     return RaftClient.newBuilder()
-        .setProperties(new RaftProperties())
+    .setProperties(new RaftProperties())
+        .setProperties(properties)
         .setRaftGroup(Constants.RAFT_GROUP)
         .build();
   }
