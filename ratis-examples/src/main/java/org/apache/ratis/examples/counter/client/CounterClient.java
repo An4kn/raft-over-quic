@@ -19,8 +19,13 @@ package org.apache.ratis.examples.counter.client;
 
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.common.Constants;
+import org.apache.ratis.netty.NettyConfigKeys;
+import org.apache.ratis.security.TlsConf;
+import org.apache.ratis.security.TlsConf.CertificatesConf;
+import org.apache.ratis.security.TlsConf.PrivateKeyConf;
 import org.apache.ratis.examples.counter.CounterCommand;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftPeer;
@@ -33,6 +38,7 @@ import org.apache.ratis.util.TimeDuration;
 import org.apache.ratis.util.Timestamp;
 
 import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -71,9 +77,20 @@ public final class CounterClient implements Closeable {
   static RaftClient newClient() {
     final RaftProperties properties = new RaftProperties();
     RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
+
+    final Parameters parameters = new Parameters();
+    final TlsConf tlsConf = new TlsConf.Builder()
+        .setName("client")
+        .setPrivateKey(new PrivateKeyConf(new File("ratis-test/src/test/resources/ssl/client.pem")))
+        .setKeyCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/client.crt")))
+        .setTrustCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/ca.crt")))
+        .setMutualTls(false)
+        .build();
+    NettyConfigKeys.Client.setTlsConf(parameters, tlsConf);
+
     return RaftClient.newBuilder()
-    .setProperties(new RaftProperties())
         .setProperties(properties)
+        .setParameters(parameters)
         .setRaftGroup(Constants.RAFT_GROUP)
         .build();
   }

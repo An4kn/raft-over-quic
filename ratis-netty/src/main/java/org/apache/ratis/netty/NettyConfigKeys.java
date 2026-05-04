@@ -51,6 +51,18 @@ public interface NettyConfigKeys {
     String USE_EPOLL_KEY = PREFIX + ".use-epoll";
     boolean USE_EPOLL_DEFAULT = true;
 
+    String TLS_CONF_PARAMETER = PREFIX + ".tls.conf";
+    Class<TlsConf> TLS_CONF_CLASS = TlsConf.class;
+
+    static TlsConf tlsConf(Parameters parameters) {
+      return parameters == null ? null
+          : getTlsConf(key -> parameters.get(key, TLS_CONF_CLASS), TLS_CONF_PARAMETER, getDefaultLog());
+    }
+    static void setTlsConf(Parameters parameters, TlsConf conf) {
+      LOG.info("setTlsConf " + conf);
+      ConfUtils.setTlsConf((key, value) -> parameters.put(key, value, TLS_CONF_CLASS), TLS_CONF_PARAMETER, conf);
+    }
+
     static String host(RaftProperties properties) {
       return get(properties::get, HOST_KEY, HOST_DEFAULT, getDefaultLog());
     }
@@ -86,6 +98,19 @@ public interface NettyConfigKeys {
 
     String USE_EPOLL_KEY = PREFIX + ".use-epoll";
     boolean USE_EPOLL_DEFAULT = true;
+
+    String TLS_CONF_PARAMETER = PREFIX + ".tls.conf";
+    Class<TlsConf> TLS_CONF_CLASS = TlsConf.class;
+
+    static TlsConf tlsConf(Parameters parameters) {
+      return parameters == null ? null
+          : getTlsConf(key -> parameters.get(key, TLS_CONF_CLASS), TLS_CONF_PARAMETER, getDefaultLog());
+    }
+    static void setTlsConf(Parameters parameters, TlsConf conf) {
+      LOG.info("setTlsConf " + conf);
+      ConfUtils.setTlsConf((key, value) -> parameters.put(key, value, TLS_CONF_CLASS), TLS_CONF_PARAMETER, conf);
+    }
+
     static boolean useEpoll(RaftProperties properties) {
       return getBoolean(properties::getBoolean, USE_EPOLL_KEY, USE_EPOLL_DEFAULT, getDefaultLog());
     }

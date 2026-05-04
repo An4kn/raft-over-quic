@@ -76,7 +76,7 @@ public class TestNettyRpcProxy extends BaseTest {
       final InetSocketAddress address = (InetSocketAddress) serverChannel.localAddress();
       final String peerAddress = address.getHostString() + ":" + address.getPort();
       final RaftPeer peer = RaftPeer.newBuilder().setId("s0").setAddress(peerAddress).build();
-      proxy = new NettyRpcProxy(peer, new RaftProperties(), clientGroup);
+      proxy = new NettyRpcProxy(peer, new RaftProperties(), clientGroup, null);
 
       // Close to force AlreadyClosedException on write and trigger rollback logic.
       proxy.close();
