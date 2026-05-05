@@ -74,10 +74,40 @@
       <version>0.0.75.Final</version>
       <classifier>${os.detected.classifier}</classifier>
     </dependency>
+    <!--
+      Bundle both macOS architectures so the fat JAR works whether built
+      with osx-x86_64 (Intel / Rosetta override) or osx-aarch_64 (M1 native).
+      The JVM picks whichever matches the running platform at load time.
+      On Linux the os-maven-plugin sets a linux-* classifier so these are
+      simply unused (but still downloaded once and cached in ~/.m2).
+    -->
+    <dependency>
+      <groupId>io.netty.incubator</groupId>
+      <artifactId>netty-incubator-codec-native-quic</artifactId>
+      <version>0.0.75.Final</version>
+      <classifier>osx-x86_64</classifier>
+    </dependency>
+    <dependency>
+      <groupId>io.netty.incubator</groupId>
+      <artifactId>netty-incubator-codec-native-quic</artifactId>
+      <version>0.0.75.Final</version>
+      <classifier>osx-aarch_64</classifier>
+    </dependency>
 
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <!--
+      BouncyCastle is required by Netty's SelfSignedCertificate generator.
+      Without it, self-signed TLS cert generation fails on modern JDKs
+      (the OpenJDK fallback generator is not supported on JDK 17+).
+    -->
+    <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcpkix-jdk18on</artifactId>
+      <version>1.78.1</version>
     </dependency>
   </dependencies>
 

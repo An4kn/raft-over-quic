@@ -48,6 +48,8 @@ import org.apache.ratis.proto.netty.NettyProtos.RaftNettyServerRequestProto;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.exceptions.AlreadyClosedException;
 import org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto;
+import org.apache.ratis.proto.RaftProtos.ReadIndexReplyProto;
+import org.apache.ratis.proto.RaftProtos.ReadIndexRequestProto;
 import org.apache.ratis.quic.codec.ShadedProtobufDecoder;
 import org.apache.ratis.quic.codec.ShadedProtobufEncoder;
 import org.apache.ratis.util.IOUtils;
@@ -418,6 +420,77 @@ public class QuicRpcProxy implements Closeable {
           result.complete(reply);
         }
         ch.close();
+      });
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      result.completeExceptionally(e);
+    }
+    return result;
+  }
+
+  /**
+   * Sends a ReadIndex request to this peer on a short-lived stream and returns
+   * a future that completes with the reply.  Used by the server's async protocol
+   * to forward Linearizable Read index queries to the leader.
+   */
+  public CompletableFuture<ReadIndexReplyProto> readIndexAsync(
+      ReadIndexRequestProto request) {
+    final CompletableFuture<ReadIndexReplyProto> result = new CompletableFuture<>();
+    try {
+      final CompletableFuture<ReadIndexReplyProto> replyFuture = new CompletableFuture<>();
+      final SimpleChannelInboundHandler<ReadIndexReplyProto> replyHandler =
+          new SimpleChannelInboundHandler<ReadIndexReplyProto>() {
+            @Override
+            protected void channelRead0(ChannelHandlerContext ctx, ReadIndexReplyProto reply) {
+              replyFuture.complete(reply);
+            }
+            @Override
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+              replyFuture.completeExceptionally(cause);
+              ctx.close();
+            }
+          };
+
+      final ChannelInboundHandlerAdapter tagWriter = new ChannelInboundHandlerAdapter() {
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) {
+          final ByteBuf buf = ctx.alloc().buffer(1)
+              .writeByte(QuicRpcService.TAG_READ_INDEX);
+          ctx.writeAndFlush(buf);
+          ctx.pipeline().remove(this);
+          ctx.fireChannelActive();
+        }
+      };
+
+      final QuicStreamChannel ch = quicChannel.createStream(
+          QuicStreamType.BIDIRECTIONAL,
+          new ChannelInitializer<QuicStreamChannel>() {
+            @Override
+            protected void initChannel(QuicStreamChannel ch) {
+              final ChannelPipeline p = ch.pipeline();
+              p.addLast(tagWriter);
+              p.addLast(new ProtobufVarint32FrameDecoder());
+              p.addLast(new ShadedProtobufDecoder<>(
+                  ReadIndexReplyProto.getDefaultInstance()));
+              p.addLast(new ProtobufVarint32LengthFieldPrepender());
+              p.addLast(ShadedProtobufEncoder.INSTANCE);
+              p.addLast(replyHandler);
+            }
+          }).sync().getNow();
+
+      ch.writeAndFlush(request).addListener(cf -> {
+        if (!cf.isSuccess()) {
+          replyFuture.completeExceptionally(cf.cause());
+        }
+      });
+
+      replyFuture.whenComplete((reply, ex) -> {
+        ch.close();
+        if (ex != null) {
+          result.completeExceptionally(ex);
+        } else {
+          result.complete(reply);
+        }
       });
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();

@@ -42,6 +42,8 @@ import io.netty.incubator.codec.quic.QuicStreamChannel;
 import org.apache.ratis.client.impl.ClientProtoUtils;
 import org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto;
 import org.apache.ratis.proto.RaftProtos.AppendEntriesRequestProto;
+import org.apache.ratis.proto.RaftProtos.ReadIndexReplyProto;
+import org.apache.ratis.proto.RaftProtos.ReadIndexRequestProto;
 import org.apache.ratis.proto.RaftProtos.GroupInfoRequestProto;
 import org.apache.ratis.proto.RaftProtos.GroupListRequestProto;
 import org.apache.ratis.proto.RaftProtos.GroupManagementRequestProto;
@@ -67,9 +69,11 @@ import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.quic.codec.ShadedProtobufDecoder;
 import org.apache.ratis.quic.codec.ShadedProtobufEncoder;
+import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerRpcWithProxy;
+import org.apache.ratis.server.protocol.RaftServerAsynchronousProtocol;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.MemoizedSupplier;
 import org.apache.ratis.util.ProtoUtils;
@@ -82,6 +86,7 @@ import java.net.InetSocketAddress;
 import java.security.cert.CertificateException;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -128,6 +133,8 @@ public final class QuicRpcService
   public static final byte TAG_REQUEST_VOTE     = 0x03;
   /** Single-request client RPC (stream closes after one reply). */
   public static final byte TAG_CLIENT_REQUEST   = 0x04;
+  /** Server-to-server ReadIndex request for Linearizable Read. */
+  public static final byte TAG_READ_INDEX       = 0x05;
 
   // ---- Builder ------------------------------------------------------------
 
@@ -175,6 +182,38 @@ public final class QuicRpcService
 
   private final InboundHandler inboundHandler = new InboundHandler();
 
+  /** Handles ReadIndex requests from peer servers (Linearizable Read protocol). */
+  @ChannelHandler.Sharable
+  class ReadIndexInboundHandler extends SimpleChannelInboundHandler<ReadIndexRequestProto> {
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, ReadIndexRequestProto request) {
+      final CompletableFuture<ReadIndexReplyProto> f;
+      try {
+        f = server.readIndexAsync(request);
+      } catch (IOException e) {
+        LOG.warn("{}: readIndex failed", getId(), e);
+        ctx.close();
+        return;
+      }
+      f.whenComplete((reply, ex) -> {
+        if (ex != null) {
+          LOG.warn("{}: readIndex failed", getId(), ex);
+          ctx.close();
+        } else {
+          ctx.writeAndFlush(reply);
+        }
+      });
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+      LOG.warn("{}: exception on ReadIndex stream {}", getId(), ctx.channel(), cause);
+      ctx.close();
+    }
+  }
+
+  private final ReadIndexInboundHandler readIndexInboundHandler = new ReadIndexInboundHandler();
+
   // ---- One-shot stream tag decoder ----------------------------------------
 
   /**
@@ -196,16 +235,17 @@ public final class QuicRpcService
       final byte tag = in.readByte();
       final ChannelPipeline p = ctx.pipeline();
 
-      // Inbound: varint32 frame splitter → shaded proto decoder
       p.addLast(new ProtobufVarint32FrameDecoder());
-      p.addLast(new ShadedProtobufDecoder<>(
-          RaftNettyServerRequestProto.getDefaultInstance()));
-
-      // Outbound: shaded proto encoder → varint32 length prepender
       p.addLast(new ProtobufVarint32LengthFieldPrepender());
       p.addLast(ShadedProtobufEncoder.INSTANCE);
 
-      p.addLast(inboundHandler);
+      if (tag == TAG_READ_INDEX) {
+        p.addLast(new ShadedProtobufDecoder<>(ReadIndexRequestProto.getDefaultInstance()));
+        p.addLast(readIndexInboundHandler);
+      } else {
+        p.addLast(new ShadedProtobufDecoder<>(RaftNettyServerRequestProto.getDefaultInstance()));
+        p.addLast(inboundHandler);
+      }
 
       if (LOG.isDebugEnabled()) {
         LOG.debug("{}: new stream tag=0x{} channel={}", getId(),
@@ -499,6 +539,31 @@ public final class QuicRpcService
       return toExceptionReply(
           Objects.requireNonNull(rpcRequest, "rpcRequest is null"), ioe);
     }
+  }
+
+  // ---- RaftServerAsynchronousProtocol ------------------------------------
+
+  private final RaftServerAsynchronousProtocol asyncProtocol =
+      new RaftServerAsynchronousProtocol() {
+        @Override
+        public CompletableFuture<AppendEntriesReplyProto> appendEntriesAsync(
+            AppendEntriesRequestProto request) {
+          throw new UnsupportedOperationException(
+              CLASS_NAME + " does not support async appendEntries");
+        }
+
+        @Override
+        public CompletableFuture<ReadIndexReplyProto> readIndexAsync(
+            ReadIndexRequestProto request) throws IOException {
+          final RaftPeerId target =
+              RaftPeerId.valueOf(request.getServerRequest().getReplyId());
+          return getProxies().getProxy(target).readIndexAsync(request);
+        }
+      };
+
+  @Override
+  public RaftServerAsynchronousProtocol async() {
+    return asyncProtocol;
   }
 
   private static RaftNettyServerReplyProto toExceptionReply(

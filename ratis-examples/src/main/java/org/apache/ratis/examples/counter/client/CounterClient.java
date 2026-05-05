@@ -19,14 +19,19 @@ package org.apache.ratis.examples.counter.client;
 
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.common.Constants;
 import org.apache.ratis.examples.counter.CounterCommand;
+import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.quic.QuicConfigKeys;
 import org.apache.ratis.rpc.SupportedRpcType;
+import org.apache.ratis.security.TlsConf;
+import org.apache.ratis.security.TlsConf.CertificatesConf;
+import org.apache.ratis.security.TlsConf.PrivateKeyConf;
 import org.apache.ratis.util.ConcurrentUtils;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.Preconditions;
@@ -34,6 +39,7 @@ import org.apache.ratis.util.TimeDuration;
 import org.apache.ratis.util.Timestamp;
 
 import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -53,6 +59,8 @@ import java.util.stream.Collectors;
  * <p>
  * Parameter to this application indicate the number of INCREMENT command, if no
  * parameter found, application use default value which is 10
+ * <p>
+ * Pass {@code --quic} anywhere in the arguments to use QUIC transport instead of Netty.
  */
 public final class CounterClient implements Closeable {
   enum Mode {
@@ -68,15 +76,33 @@ public final class CounterClient implements Closeable {
     }
   }
 
+  // Set once in main() before constructing CounterClient.
+  private static boolean useQuic = false;
+
   //build the client
   static RaftClient newClient() {
     final RaftProperties properties = new RaftProperties();
-    RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
-    // Skip server cert verification — servers use SelfSignedCertificate by default.
-    QuicConfigKeys.Client.setTlsInsecure(properties, true);
+    final Parameters parameters = new Parameters();
+
+    if (useQuic) {
+      RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
+      // Servers use SelfSignedCertificate by default; skip verification.
+      QuicConfigKeys.Client.setTlsInsecure(properties, true);
+    } else {
+      RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
+      final TlsConf tlsConf = new TlsConf.Builder()
+          .setName("client")
+          .setPrivateKey(new PrivateKeyConf(new File("ratis-test/src/test/resources/ssl/client.pem")))
+          .setKeyCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/client.crt")))
+          .setTrustCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/ca.crt")))
+          .setMutualTls(false)
+          .build();
+      NettyConfigKeys.Client.setTlsConf(parameters, tlsConf);
+    }
 
     return RaftClient.newBuilder()
         .setProperties(properties)
+        .setParameters(parameters)
         .setRaftGroup(Constants.RAFT_GROUP)
         .build();
   }
@@ -187,11 +213,17 @@ public final class CounterClient implements Closeable {
   }
 
   public static void main(String[] args) {
+    final List<String> argList = Arrays.asList(args);
+    useQuic = argList.contains("--quic");
+    final List<String> positional = argList.stream()
+        .filter(a -> !a.startsWith("--"))
+        .collect(Collectors.toList());
+
     try(CounterClient client = new CounterClient()) {
       //the number of INCREMENT commands, default is 10
-      final int increment = args.length > 0 ? Integer.parseInt(args[0]) : 10;
-      final Mode mode = Mode.parse(args.length > 1? args[1] : null);
-      final int numClients = args.length > 2 ? Integer.parseInt(args[2]) : 1;
+      final int increment = positional.size() > 0 ? Integer.parseInt(positional.get(0)) : 10;
+      final Mode mode = Mode.parse(positional.size() > 1 ? positional.get(1) : null);
+      final int numClients = positional.size() > 2 ? Integer.parseInt(positional.get(2)) : 1;
 
       final ExecutorService executor = Executors.newFixedThreadPool(Math.max(numClients, Constants.PEERS.size()));
       try {
@@ -204,13 +236,15 @@ public final class CounterClient implements Closeable {
       System.err.println();
       System.err.println("args = " + Arrays.toString(args));
       System.err.println();
-      System.err.printf("Usage: java %s [INCREMENT] [DRY_RUN|ASYNC|IO] [CLIENTS]%n", CounterClient.class.getName());
+      System.err.printf("Usage: java %s [INCREMENT] [DRY_RUN|ASYNC|IO] [CLIENTS] [--quic]%n",
+          CounterClient.class.getName());
       System.err.println();
       System.err.println("       INCREMENT: the number of INCREMENT commands to be sent (default is 10)");
       System.err.println("       DRY_RUN  : dry run only (default)");
       System.err.println("       ASYNC    : use the AsyncApi");
       System.err.println("       IO       : use the BlockingApi");
       System.err.println("       CLIENTS  : the number of clients (default is 1)");
+      System.err.println("       --quic   : use QUIC transport (default: Netty/TCP)");
       System.exit(1);
     }
   }

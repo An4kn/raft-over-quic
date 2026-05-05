@@ -18,11 +18,16 @@
 package org.apache.ratis.examples.counter.server;
 
 import org.apache.ratis.RaftConfigKeys;
+import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.common.Constants;
+import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.quic.QuicConfigKeys;
 import org.apache.ratis.rpc.SupportedRpcType;
+import org.apache.ratis.security.TlsConf;
+import org.apache.ratis.security.TlsConf.CertificatesConf;
+import org.apache.ratis.security.TlsConf.PrivateKeyConf;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
@@ -34,6 +39,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 import java.util.Scanner;
 
@@ -47,11 +53,19 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * <p>
  * Run this application three times with three different parameter set-up a
  * ratis cluster which maintain a counter value replicated in each server memory
+ * <p>
+ * Pass {@code --quic} as the last argument to use QUIC transport instead of Netty.
  */
 public final class CounterServer implements Closeable {
   private final RaftServer server;
 
-  public CounterServer(RaftPeer peer, File storageDir, TimeDuration simulatedSlowness) throws IOException {
+  public CounterServer(RaftPeer peer, File storageDir, TimeDuration simulatedSlowness)
+      throws IOException {
+    this(peer, storageDir, simulatedSlowness, false);
+  }
+
+  public CounterServer(RaftPeer peer, File storageDir, TimeDuration simulatedSlowness,
+      boolean useQuic) throws IOException {
     //create a property object
     final RaftProperties properties = new RaftProperties();
 
@@ -68,19 +82,43 @@ public final class CounterServer implements Closeable {
 
     //set the port (different for each peer) in RaftProperty object
     final int port = NetUtils.createSocketAddr(peer.getAddress()).getPort();
-    RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
-    QuicConfigKeys.Server.setPort(properties, port);
-    // Insecure mode: accept any server cert on outgoing P2P connections.
-    // Server uses SelfSignedCertificate by default when no TLS files are configured.
-    QuicConfigKeys.Client.setTlsInsecure(properties, true);
 
     //create the counter state machine which holds the counter value
     final CounterStateMachine counterStateMachine = new CounterStateMachine(simulatedSlowness);
+
+    final Parameters parameters = new Parameters();
+
+    if (useQuic) {
+      RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
+      QuicConfigKeys.Server.setPort(properties, port);
+      // Server uses SelfSignedCertificate by default; skip verification on outgoing P2P connections.
+      QuicConfigKeys.Client.setTlsInsecure(properties, true);
+    } else {
+      RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
+      NettyConfigKeys.Server.setPort(properties, port);
+
+      NettyConfigKeys.Server.setTlsConf(parameters, new TlsConf.Builder()
+          .setName("server")
+          .setPrivateKey(new PrivateKeyConf(new File("ratis-test/src/test/resources/ssl/server.pem")))
+          .setKeyCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/server.crt")))
+          .setTrustCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/ca.crt")))
+          .setMutualTls(false)
+          .build());
+
+      NettyConfigKeys.Client.setTlsConf(parameters, new TlsConf.Builder()
+          .setName("server-as-client")
+          .setPrivateKey(new PrivateKeyConf(new File("ratis-test/src/test/resources/ssl/client.pem")))
+          .setKeyCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/client.crt")))
+          .setTrustCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/ca.crt")))
+          .setMutualTls(false)
+          .build());
+    }
 
     //build the Raft server
     this.server = RaftServer.newBuilder()
         .setGroup(Constants.RAFT_GROUP)
         .setProperties(properties)
+        .setParameters(parameters)
         .setServerId(peer.getId())
         .setStateMachine(counterStateMachine)
         .setOption(RaftStorage.StartupOption.RECOVER)
@@ -98,37 +136,46 @@ public final class CounterServer implements Closeable {
 
   public static void main(String[] args) {
     try {
-      //get peerIndex from the arguments
-      if (args.length != 1) {
-        throw new IllegalArgumentException("Invalid argument number: expected to be 1 but actual is " + args.length);
+      final List<String> argList = Arrays.asList(args);
+      final boolean useQuic = argList.contains("--quic");
+      final List<String> positional = argList.stream()
+          .filter(a -> !a.startsWith("--"))
+          .collect(java.util.stream.Collectors.toList());
+
+      if (positional.size() != 1) {
+        throw new IllegalArgumentException(
+            "Invalid argument number: expected 1 positional argument but got " + positional.size());
       }
-      final int peerIndex = Integer.parseInt(args[0]);
+      final int peerIndex = Integer.parseInt(positional.get(0));
       if (peerIndex < 0 || peerIndex > 2) {
         throw new IllegalArgumentException("The server index must be 0, 1 or 2: peerIndex=" + peerIndex);
       }
       TimeDuration simulatedSlowness = Optional.ofNullable(Constants.SIMULATED_SLOWNESS)
-                  .map(slownessList -> slownessList.get(peerIndex))
-                  .orElse(TimeDuration.ZERO);
-      startServer(peerIndex, simulatedSlowness);
+          .map(slownessList -> slownessList.get(peerIndex))
+          .orElse(TimeDuration.ZERO);
+      startServer(peerIndex, simulatedSlowness, useQuic);
     } catch(Throwable e) {
       e.printStackTrace();
       System.err.println();
       System.err.println("args = " + Arrays.toString(args));
       System.err.println();
-      System.err.println("Usage: java org.apache.ratis.examples.counter.server.CounterServer peer_index");
+      System.err.println("Usage: java org.apache.ratis.examples.counter.server.CounterServer peer_index [--quic]");
       System.err.println();
       System.err.println("       peer_index must be 0, 1 or 2");
+      System.err.println("       --quic     use QUIC transport (default: Netty/TCP)");
       System.exit(1);
     }
   }
 
-  private static void startServer(int peerIndex, TimeDuration simulatedSlowness) throws IOException {
+  private static void startServer(int peerIndex, TimeDuration simulatedSlowness,
+      boolean useQuic) throws IOException {
     //get peer and define storage dir
     final RaftPeer currentPeer = Constants.PEERS.get(peerIndex);
     final File storageDir = new File("./" + currentPeer.getId());
 
     //start a counter server
-    try(CounterServer counterServer = new CounterServer(currentPeer, storageDir, simulatedSlowness)) {
+    try(CounterServer counterServer = new CounterServer(
+        currentPeer, storageDir, simulatedSlowness, useQuic)) {
       counterServer.start();
 
       //exit when any input entered
