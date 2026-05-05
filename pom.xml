@@ -63,6 +63,7 @@
     <module>ratis-resource-bundle</module>
     <module>ratis-grpc</module>
     <module>ratis-netty</module>
+    <module>ratis-quic</module>
 
     <module>ratis-test</module>
 
@@ -312,6 +313,12 @@
         <version>${project.version}</version>
         <type>test-jar</type>
         <scope>test</scope>
+      </dependency>
+
+      <dependency>
+        <artifactId>ratis-quic</artifactId>
+        <groupId>org.apache.ratis</groupId>
+        <version>${project.version}</version>
       </dependency>
 
       <dependency>

@@ -89,6 +89,10 @@
       <groupId>org.apache.ratis</groupId>
     </dependency>
     <dependency>
+      <artifactId>ratis-quic</artifactId>
+      <groupId>org.apache.ratis</groupId>
+    </dependency>
+    <dependency>
       <artifactId>ratis-netty</artifactId>
       <groupId>org.apache.ratis</groupId>
       <scope>test</scope>

@@ -18,15 +18,11 @@
 package org.apache.ratis.examples.counter.server;
 
 import org.apache.ratis.RaftConfigKeys;
-import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.common.Constants;
-import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.quic.QuicConfigKeys;
 import org.apache.ratis.rpc.SupportedRpcType;
-import org.apache.ratis.security.TlsConf;
-import org.apache.ratis.security.TlsConf.CertificatesConf;
-import org.apache.ratis.security.TlsConf.PrivateKeyConf;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
@@ -72,36 +68,19 @@ public final class CounterServer implements Closeable {
 
     //set the port (different for each peer) in RaftProperty object
     final int port = NetUtils.createSocketAddr(peer.getAddress()).getPort();
-    RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
-    NettyConfigKeys.Server.setPort(properties, port);
-    
-    
+    RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
+    QuicConfigKeys.Server.setPort(properties, port);
+    // Insecure mode: accept any server cert on outgoing P2P connections.
+    // Server uses SelfSignedCertificate by default when no TLS files are configured.
+    QuicConfigKeys.Client.setTlsInsecure(properties, true);
+
     //create the counter state machine which holds the counter value
     final CounterStateMachine counterStateMachine = new CounterStateMachine(simulatedSlowness);
-
-    final Parameters parameters = new Parameters();
-
-    NettyConfigKeys.Server.setTlsConf(parameters, new TlsConf.Builder()
-        .setName("server")
-        .setPrivateKey(new PrivateKeyConf(new File("ratis-test/src/test/resources/ssl/server.pem")))
-        .setKeyCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/server.crt")))
-        .setTrustCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/ca.crt")))
-        .setMutualTls(false)
-        .build());
-
-    NettyConfigKeys.Client.setTlsConf(parameters, new TlsConf.Builder()
-        .setName("server-as-client")
-        .setPrivateKey(new PrivateKeyConf(new File("ratis-test/src/test/resources/ssl/client.pem")))
-        .setKeyCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/client.crt")))
-        .setTrustCertificates(new CertificatesConf(new File("ratis-test/src/test/resources/ssl/ca.crt")))
-        .setMutualTls(false)
-        .build());
 
     //build the Raft server
     this.server = RaftServer.newBuilder()
         .setGroup(Constants.RAFT_GROUP)
         .setProperties(properties)
-        .setParameters(parameters)
         .setServerId(peer.getId())
         .setStateMachine(counterStateMachine)
         .setOption(RaftStorage.StartupOption.RECOVER)

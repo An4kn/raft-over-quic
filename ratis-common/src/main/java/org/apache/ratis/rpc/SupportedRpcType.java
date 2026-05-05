@@ -24,7 +24,8 @@ import org.apache.ratis.util.ReflectionUtils;
 public enum SupportedRpcType implements RpcType {
   NETTY("org.apache.ratis.netty.NettyFactory"),
   GRPC("org.apache.ratis.grpc.GrpcFactory"),
-  HADOOP("org.apache.ratis.hadooprpc.HadoopFactory");
+  HADOOP("org.apache.ratis.hadooprpc.HadoopFactory"),
+  QUIC("org.apache.ratis.quic.QuicFactory");
 
   /** Same as {@link #valueOf(String)} except that this method is case insensitive. */
   public static SupportedRpcType valueOfIgnoreCase(String s) {
