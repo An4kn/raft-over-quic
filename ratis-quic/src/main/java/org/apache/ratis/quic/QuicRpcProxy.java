@@ -19,9 +19,7 @@ package org.apache.ratis.quic;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -69,35 +67,25 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.ratis.proto.netty.NettyProtos.RaftNettyServerReplyProto.RaftNettyServerReplyCase.EXCEPTIONREPLY;
 
 /**
  * Client-side QUIC proxy for one remote Raft peer.
  *
- * <h3>Connection model</h3>
- * A single {@link QuicChannel} (one UDP 4-tuple) is created per peer.
- * On top of that connection the proxy opens exactly <em>four persistent
- * bidirectional streams</em>, one per Raft message type:
- * <ol>
- *   <li>Stream {@link QuicRpcService#TAG_APPEND_ENTRIES}   – log replication</li>
- *   <li>Stream {@link QuicRpcService#TAG_HEARTBEAT}        – keep-alive</li>
- *   <li>Stream {@link QuicRpcService#TAG_INSTALL_SNAPSHOT} – snapshot transfer</li>
- *   <li>Stream {@link QuicRpcService#TAG_REQUEST_VOTE}     – leader election</li>
- * </ol>
- * Keeping heartbeats on their own stream means they are never head-of-line
- * blocked behind a large AppendEntries batch — the central QUIC advantage over
- * TCP for Raft consensus.
- *
- * <h3>Framing</h3>
- * Each message is prefixed with a Protobuf varint32 length (same as
- * {@code ratis-netty}). Multiple request-reply pairs flow through each persistent
- * stream; the {@code callId} in the proto is used to route replies back to the
- * originating {@link CompletableFuture}.
+ * <p>Maintains a single {@link QuicChannel} with four persistent bidirectional
+ * streams (AppendEntries, Heartbeat, InstallSnapshot, RequestVote).  When the
+ * connection drops, {@link #scheduleReconnect()} is called automatically and a
+ * new {@link Connection} is established after a short delay — matching the
+ * reconnect behaviour that Netty/TCP gets for free from {@code PeerProxyMap}.
  */
 public class QuicRpcProxy implements Closeable {
 
   public static final Logger LOG = LoggerFactory.getLogger(QuicRpcProxy.class);
+
+  private static final long RECONNECT_DELAY_MS = 200;
 
   // ---- PeerMap ------------------------------------------------------------
 
@@ -133,39 +121,49 @@ public class QuicRpcProxy implements Closeable {
     }
   }
 
-  // ---- Utility: extract callId from any reply proto -----------------------
+  // ---- Connection (holds QuicChannel + 4 streams + 4 handlers) ------------
 
-  static long getCallId(RaftNettyServerReplyProto proto) {
-    switch (proto.getRaftNettyServerReplyCase()) {
-      case REQUESTVOTEREPLY:
-        return proto.getRequestVoteReply().getServerReply().getCallId();
-      case STARTLEADERELECTIONREPLY:
-        return proto.getStartLeaderElectionReply().getServerReply().getCallId();
-      case APPENDENTRIESREPLY:
-        return proto.getAppendEntriesReply().getServerReply().getCallId();
-      case INSTALLSNAPSHOTREPLY:
-        return proto.getInstallSnapshotReply().getServerReply().getCallId();
-      case RAFTCLIENTREPLY:
-        return proto.getRaftClientReply().getRpcReply().getCallId();
-      case GROUPLISTREPLY:
-        return proto.getGroupListReply().getRpcReply().getCallId();
-      case GROUPINFOREPLY:
-        return proto.getGroupInfoReply().getRpcReply().getCallId();
-      case EXCEPTIONREPLY:
-        return proto.getExceptionReply().getRpcReply().getCallId();
-      default:
-        throw new UnsupportedOperationException(
-            "Reply case not supported: " + proto.getRaftNettyServerReplyCase());
+  /**
+   * All mutable connection state bundled into one object so it can be swapped
+   * atomically via {@link AtomicReference} on reconnect.
+   */
+  private class Connection {
+    final QuicChannel quicChannel;
+    final QuicStreamChannel appendEntriesStream;
+    final QuicStreamChannel heartbeatStream;
+    final QuicStreamChannel installSnapshotStream;
+    final QuicStreamChannel requestVoteStream;
+    final StreamHandler appendEntriesHandler;
+    final StreamHandler heartbeatHandler;
+    final StreamHandler installSnapshotHandler;
+    final StreamHandler requestVoteHandler;
+
+    Connection(QuicChannel qc,
+        QuicStreamChannel ae, QuicStreamChannel hb,
+        QuicStreamChannel is, QuicStreamChannel rv,
+        StreamHandler aeH, StreamHandler hbH,
+        StreamHandler isH, StreamHandler rvH) {
+      this.quicChannel           = qc;
+      this.appendEntriesStream   = ae;
+      this.heartbeatStream       = hb;
+      this.installSnapshotStream = is;
+      this.requestVoteStream     = rv;
+      this.appendEntriesHandler  = aeH;
+      this.heartbeatHandler      = hbH;
+      this.installSnapshotHandler = isH;
+      this.requestVoteHandler    = rvH;
+    }
+
+    void failAll(Throwable cause) {
+      appendEntriesHandler.failAll(cause);
+      heartbeatHandler.failAll(cause);
+      installSnapshotHandler.failAll(cause);
+      requestVoteHandler.failAll(cause);
     }
   }
 
   // ---- Per-stream handler -------------------------------------------------
 
-  /**
-   * One instance per persistent stream. Maintains the pending-reply map for
-   * requests in flight on that stream. Replies arrive asynchronously on the
-   * Netty IO thread and are dispatched by {@code callId}.
-   */
   class StreamHandler extends SimpleChannelInboundHandler<RaftNettyServerReplyProto> {
 
     private final Map<Long, CompletableFuture<RaftNettyServerReplyProto>> pending =
@@ -200,6 +198,7 @@ public class QuicRpcProxy implements Closeable {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
       failAll(new AlreadyClosedException("Stream to " + peer + " is inactive"));
+      scheduleReconnect();
       super.channelInactive(ctx);
     }
 
@@ -220,7 +219,7 @@ public class QuicRpcProxy implements Closeable {
       return future;
     }
 
-    private void failAll(Throwable cause) {
+    void failAll(Throwable cause) {
       if (!pending.isEmpty()) {
         pending.values().forEach(f -> f.completeExceptionally(cause));
         pending.clear();
@@ -228,37 +227,36 @@ public class QuicRpcProxy implements Closeable {
     }
   }
 
-  // ---- Fields & construction ----------------------------------------------
+  // ---- Fields -------------------------------------------------------------
 
   private final RaftPeer peer;
   private final TimeDuration requestTimeout;
+  private final EventLoopGroup group;
+  private final QuicSslContext sslCtx;
 
-  /** Underlying UDP channel (shared, not per-peer). */
+  /** Underlying UDP socket — reused across reconnects. */
   private final Channel udpChannel;
-  /** The single QUIC logical connection to this peer. */
-  private final QuicChannel quicChannel;
 
-  // The four persistent bidirectional streams
-  private final QuicStreamChannel appendEntriesStream;
-  private final QuicStreamChannel heartbeatStream;
-  private final QuicStreamChannel installSnapshotStream;
-  private final QuicStreamChannel requestVoteStream;
+  /** Current live connection; null while reconnecting. */
+  private final AtomicReference<Connection> connectionRef = new AtomicReference<>();
 
-  // One handler per stream (each has its own pending-reply map)
-  private final StreamHandler appendEntriesHandler  = new StreamHandler();
-  private final StreamHandler heartbeatHandler      = new StreamHandler();
-  private final StreamHandler installSnapshotHandler = new StreamHandler();
-  private final StreamHandler requestVoteHandler    = new StreamHandler();
+  /** Guards against concurrent/redundant reconnect attempts. */
+  private final AtomicBoolean reconnecting = new AtomicBoolean(false);
+
+  private volatile boolean closed = false;
+
+  // ---- Construction -------------------------------------------------------
 
   QuicRpcProxy(RaftPeer peer, RaftProperties properties,
       EventLoopGroup group, QuicSslContext sslCtx) throws InterruptedException {
     this.peer           = peer;
     this.requestTimeout = RaftClientConfigKeys.Rpc.requestTimeout(properties);
+    this.group          = group;
+    this.sslCtx         = sslCtx;
 
-    // 1. Bind a local UDP socket (port 0 = ephemeral).
     final ChannelHandler clientCodec = new QuicClientCodecBuilder()
         .sslContext(sslCtx)
-        .maxIdleTimeout(30_000, TimeUnit.MILLISECONDS)
+        .maxIdleTimeout(0, TimeUnit.MILLISECONDS)
         .initialMaxData(10_000_000)
         .initialMaxStreamDataBidirectionalLocal(1_000_000)
         .initialMaxStreamDataBidirectionalRemote(1_000_000)
@@ -273,44 +271,85 @@ public class QuicRpcProxy implements Closeable {
         .sync()
         .channel();
 
-    // 2. Establish the QUIC handshake (TLS 1.3 inside QUIC).
-    final InetSocketAddress remoteAddr =
-        NetUtils.createSocketAddr(peer.getAddress());
+    connectionRef.set(connect());
+  }
 
-    // SSL context is embedded in the QuicClientCodecBuilder (clientCodec) above —
-    // QuicChannelBootstrap in 0.0.75+ does not accept sslContext() separately.
-    this.quicChannel = QuicChannel.newBootstrap(udpChannel)
+  /**
+   * Opens a fresh {@link QuicChannel} to the peer and creates the four
+   * persistent streams on top of it.  Called on first connect and on every
+   * reconnect.
+   */
+  private Connection connect() throws InterruptedException {
+    final InetSocketAddress remoteAddr = NetUtils.createSocketAddr(peer.getAddress());
+
+    final QuicChannel qc = QuicChannel.newBootstrap(udpChannel)
         .remoteAddress(remoteAddr)
         .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
           @Override
           protected void initChannel(QuicStreamChannel ch) {
-            // server-initiated streams are not expected in the P2P model
-            ch.close();
+            ch.close(); // server-initiated streams not expected
           }
         })
         .connect()
         .sync()
         .getNow();
 
-    // 3. Open the four persistent bidirectional streams, one per Raft message type.
-    this.appendEntriesStream  = openStream(QuicRpcService.TAG_APPEND_ENTRIES,
-        appendEntriesHandler);
-    this.heartbeatStream      = openStream(QuicRpcService.TAG_HEARTBEAT,
-        heartbeatHandler);
-    this.installSnapshotStream = openStream(QuicRpcService.TAG_INSTALL_SNAPSHOT,
-        installSnapshotHandler);
-    this.requestVoteStream    = openStream(QuicRpcService.TAG_REQUEST_VOTE,
-        requestVoteHandler);
+    final StreamHandler aeH  = new StreamHandler();
+    final StreamHandler hbH  = new StreamHandler();
+    final StreamHandler isH  = new StreamHandler();
+    final StreamHandler rvH  = new StreamHandler();
+
+    final QuicStreamChannel ae = openStream(qc, QuicRpcService.TAG_APPEND_ENTRIES,   aeH);
+    final QuicStreamChannel hb = openStream(qc, QuicRpcService.TAG_HEARTBEAT,        hbH);
+    final QuicStreamChannel is = openStream(qc, QuicRpcService.TAG_INSTALL_SNAPSHOT, isH);
+    final QuicStreamChannel rv = openStream(qc, QuicRpcService.TAG_REQUEST_VOTE,     rvH);
+
+    return new Connection(qc, ae, hb, is, rv, aeH, hbH, isH, rvH);
   }
 
+  // ---- Reconnect logic ----------------------------------------------------
+
   /**
-   * Opens one persistent bidirectional QUIC stream, writes the 1-byte tag so
-   * the server can identify the stream role, then configures the full pipeline.
+   * Triggered by {@link StreamHandler#channelInactive} when any persistent
+   * stream dies.  Only one reconnect attempt runs at a time.
    */
-  private QuicStreamChannel openStream(byte tag, StreamHandler handler)
+  private void scheduleReconnect() {
+    if (closed) {
+      return;
+    }
+    if (!reconnecting.compareAndSet(false, true)) {
+      return; // another stream already triggered reconnect
+    }
+    final Connection old = connectionRef.getAndSet(null);
+    if (old != null) {
+      LOG.warn("{}: QUIC connection lost — reconnecting in {}ms", peer, RECONNECT_DELAY_MS);
+      old.failAll(new AlreadyClosedException("Reconnecting to " + peer));
+      old.quicChannel.close();
+    }
+    group.schedule(this::doReconnect, RECONNECT_DELAY_MS, TimeUnit.MILLISECONDS);
+  }
+
+  private void doReconnect() {
+    if (closed) {
+      reconnecting.set(false);
+      return;
+    }
+    try {
+      final Connection conn = connect();
+      connectionRef.set(conn);
+      reconnecting.set(false);
+      LOG.info("{}: reconnected successfully", peer);
+    } catch (Exception e) {
+      LOG.warn("{}: reconnect failed, retrying in 1s", peer, e);
+      group.schedule(this::doReconnect, 1_000, TimeUnit.MILLISECONDS);
+    }
+  }
+
+  // ---- Stream helpers -----------------------------------------------------
+
+  private QuicStreamChannel openStream(QuicChannel qc, byte tag, StreamHandler handler)
       throws InterruptedException {
 
-    // TagWriter sends the role byte on channelActive then removes itself.
     final ChannelInboundHandlerAdapter tagWriter = new ChannelInboundHandlerAdapter() {
       @Override
       public void channelActive(ChannelHandlerContext ctx) {
@@ -321,24 +360,17 @@ public class QuicRpcProxy implements Closeable {
       }
     };
 
-    return quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
+    return qc.createStream(QuicStreamType.BIDIRECTIONAL,
         new ChannelInitializer<QuicStreamChannel>() {
           @Override
           protected void initChannel(QuicStreamChannel ch) {
             final ChannelPipeline p = ch.pipeline();
-
-            // tagWriter fires before any proto traffic
             p.addLast(tagWriter);
-
-            // Inbound: varint32 framing → shaded proto decoder → reply handler
             p.addLast(new ProtobufVarint32FrameDecoder());
             p.addLast(new ShadedProtobufDecoder<>(
                 RaftNettyServerReplyProto.getDefaultInstance()));
-
-            // Outbound: shaded proto encoder → varint32 length prepender
             p.addLast(new ProtobufVarint32LengthFieldPrepender());
             p.addLast(ShadedProtobufEncoder.INSTANCE);
-
             p.addLast(handler);
           }
         }).sync().getNow();
@@ -346,36 +378,40 @@ public class QuicRpcProxy implements Closeable {
 
   // ---- Public API ---------------------------------------------------------
 
-  /** Selects the correct persistent stream and sends the request asynchronously. */
   public CompletableFuture<RaftNettyServerReplyProto> sendAsync(
       RaftNettyServerRequestProto proto) {
+
+    final Connection conn = connectionRef.get();
+    if (conn == null) {
+      final CompletableFuture<RaftNettyServerReplyProto> f = new CompletableFuture<>();
+      f.completeExceptionally(
+          new IOException("Not connected to " + peer + " (reconnecting)"));
+      return f;
+    }
+
     final QuicStreamChannel stream;
     final StreamHandler handler;
 
     switch (proto.getRaftNettyServerRequestCase()) {
       case APPENDENTRIESREQUEST:
-        // Route by content: heartbeat = empty AppendEntries
         if (proto.getAppendEntriesRequest().getEntriesCount() == 0) {
-          stream  = heartbeatStream;
-          handler = heartbeatHandler;
+          stream  = conn.heartbeatStream;
+          handler = conn.heartbeatHandler;
         } else {
-          stream  = appendEntriesStream;
-          handler = appendEntriesHandler;
+          stream  = conn.appendEntriesStream;
+          handler = conn.appendEntriesHandler;
         }
         break;
       case INSTALLSNAPSHOTREQUEST:
-        stream  = installSnapshotStream;
-        handler = installSnapshotHandler;
+        stream  = conn.installSnapshotStream;
+        handler = conn.installSnapshotHandler;
         break;
       case REQUESTVOTEREQUEST:
       case STARTLEADERELECTIONREQUEST:
-        stream  = requestVoteStream;
-        handler = requestVoteHandler;
+        stream  = conn.requestVoteStream;
+        handler = conn.requestVoteHandler;
         break;
       default:
-        // All other messages (client requests, admin) go via a fresh stream.
-        // This path is not used in normal P2P operation; QuicClientRpc handles
-        // external client traffic on its own connection.
         return sendOnNewStream(proto);
     }
     return handler.send(stream, proto);
@@ -401,18 +437,20 @@ public class QuicRpcProxy implements Closeable {
     }
   }
 
-  /**
-   * Sends a request on a brand-new short-lived stream (fallback for request
-   * types that don't belong to the four persistent P2P streams).
-   */
   private CompletableFuture<RaftNettyServerReplyProto> sendOnNewStream(
       RaftNettyServerRequestProto proto) {
     final CompletableFuture<RaftNettyServerReplyProto> result =
         new CompletableFuture<>();
+    final Connection conn = connectionRef.get();
+    if (conn == null) {
+      result.completeExceptionally(
+          new IOException("Not connected to " + peer + " (reconnecting)"));
+      return result;
+    }
     try {
       final StreamHandler ephemeralHandler = new StreamHandler();
-      final QuicStreamChannel ch = openStream(QuicRpcService.TAG_CLIENT_REQUEST,
-          ephemeralHandler);
+      final QuicStreamChannel ch = openStream(
+          conn.quicChannel, QuicRpcService.TAG_CLIENT_REQUEST, ephemeralHandler);
       ephemeralHandler.send(ch, proto).whenComplete((reply, ex) -> {
         if (ex != null) {
           result.completeExceptionally(ex);
@@ -428,20 +466,22 @@ public class QuicRpcProxy implements Closeable {
     return result;
   }
 
-  /**
-   * Sends a ReadIndex request to this peer on a short-lived stream and returns
-   * a future that completes with the reply.  Used by the server's async protocol
-   * to forward Linearizable Read index queries to the leader.
-   */
   public CompletableFuture<ReadIndexReplyProto> readIndexAsync(
       ReadIndexRequestProto request) {
     final CompletableFuture<ReadIndexReplyProto> result = new CompletableFuture<>();
+    final Connection conn = connectionRef.get();
+    if (conn == null) {
+      result.completeExceptionally(
+          new IOException("Not connected to " + peer + " (reconnecting)"));
+      return result;
+    }
     try {
       final CompletableFuture<ReadIndexReplyProto> replyFuture = new CompletableFuture<>();
       final SimpleChannelInboundHandler<ReadIndexReplyProto> replyHandler =
           new SimpleChannelInboundHandler<ReadIndexReplyProto>() {
             @Override
-            protected void channelRead0(ChannelHandlerContext ctx, ReadIndexReplyProto reply) {
+            protected void channelRead0(ChannelHandlerContext ctx,
+                ReadIndexReplyProto reply) {
               replyFuture.complete(reply);
             }
             @Override
@@ -462,7 +502,7 @@ public class QuicRpcProxy implements Closeable {
         }
       };
 
-      final QuicStreamChannel ch = quicChannel.createStream(
+      final QuicStreamChannel ch = conn.quicChannel.createStream(
           QuicStreamType.BIDIRECTIONAL,
           new ChannelInitializer<QuicStreamChannel>() {
             @Override
@@ -501,11 +541,39 @@ public class QuicRpcProxy implements Closeable {
 
   @Override
   public void close() {
-    quicChannel.close();
+    closed = true;
+    final Connection conn = connectionRef.getAndSet(null);
+    if (conn != null) {
+      conn.quicChannel.close();
+    }
     udpChannel.close();
   }
 
   // ---- Helpers ------------------------------------------------------------
+
+  static long getCallId(RaftNettyServerReplyProto proto) {
+    switch (proto.getRaftNettyServerReplyCase()) {
+      case REQUESTVOTEREPLY:
+        return proto.getRequestVoteReply().getServerReply().getCallId();
+      case STARTLEADERELECTIONREPLY:
+        return proto.getStartLeaderElectionReply().getServerReply().getCallId();
+      case APPENDENTRIESREPLY:
+        return proto.getAppendEntriesReply().getServerReply().getCallId();
+      case INSTALLSNAPSHOTREPLY:
+        return proto.getInstallSnapshotReply().getServerReply().getCallId();
+      case RAFTCLIENTREPLY:
+        return proto.getRaftClientReply().getRpcReply().getCallId();
+      case GROUPLISTREPLY:
+        return proto.getGroupListReply().getRpcReply().getCallId();
+      case GROUPINFOREPLY:
+        return proto.getGroupInfoReply().getRpcReply().getCallId();
+      case EXCEPTIONREPLY:
+        return proto.getExceptionReply().getRpcReply().getCallId();
+      default:
+        throw new UnsupportedOperationException(
+            "Reply case not supported: " + proto.getRaftNettyServerReplyCase());
+    }
+  }
 
   static long getCallIdFromRequest(RaftNettyServerRequestProto proto) {
     final RaftRpcRequestProto rpc;
@@ -541,10 +609,8 @@ public class QuicRpcProxy implements Closeable {
     return rpc.getCallId();
   }
 
-  // ---- TLS context for outgoing connections -------------------------------
-
   public static QuicSslContext buildClientSslContext(RaftProperties properties) {
-    final String caCert   = QuicConfigKeys.Client.tlsCaCert(properties);
+    final String caCert    = QuicConfigKeys.Client.tlsCaCert(properties);
     final boolean insecure = QuicConfigKeys.Client.tlsInsecure(properties);
     final QuicSslContextBuilder b = QuicSslContextBuilder.forClient()
         .applicationProtocols(QuicConfigKeys.ALPN);
@@ -553,7 +619,6 @@ public class QuicRpcProxy implements Closeable {
     } else if (caCert != null) {
       b.trustManager(new File(caCert));
     }
-    // Mutual TLS (optional)
     final String cert = QuicConfigKeys.Client.tlsCert(properties);
     final String key  = QuicConfigKeys.Client.tlsKey(properties);
     if (cert != null && key != null) {

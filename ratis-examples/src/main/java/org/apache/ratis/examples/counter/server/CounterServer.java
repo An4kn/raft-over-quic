@@ -72,13 +72,8 @@ public final class CounterServer implements Closeable {
     //set the storage directory (different for each peer) in the RaftProperty object
     RaftServerConfigKeys.setStorageDir(properties, Collections.singletonList(storageDir));
 
-    //set the read policy to Linearizable Read.
-    //the Default policy will route read-only requests to leader and directly query leader statemachine.
-    //Linearizable Read allows to route read-only requests to any group member
-    //and uses ReadIndex to guarantee strong consistency.
-    RaftServerConfigKeys.Read.setOption(properties, RaftServerConfigKeys.Read.Option.LINEARIZABLE);
-    //set the linearizable read timeout
-    RaftServerConfigKeys.Read.setTimeout(properties, TimeDuration.ONE_MINUTE);
+    // DEFAULT read policy — routes read-only requests to the leader (no server-to-server ReadIndex).
+    // Same setting for QUIC and NETTY so the comparison is fair.
 
     //set the port (different for each peer) in RaftProperty object
     final int port = NetUtils.createSocketAddr(peer.getAddress()).getPort();

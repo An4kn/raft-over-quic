@@ -19,6 +19,7 @@ package org.apache.ratis.examples.counter.client;
 
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.common.Constants;
@@ -88,6 +89,10 @@ public final class CounterClient implements Closeable {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
       // Servers use SelfSignedCertificate by default; skip verification.
       QuicConfigKeys.Client.setTlsInsecure(properties, true);
+      // QUIC over UDP has no immediate "connection refused" like TCP — when the leader dies,
+      // requests sit until the per-request timeout fires. Shorten it so failover is fast.
+      RaftClientConfigKeys.Rpc.setRequestTimeout(properties,
+          TimeDuration.valueOf(500, java.util.concurrent.TimeUnit.MILLISECONDS));
     } else {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
       final TlsConf tlsConf = new TlsConf.Builder()
@@ -153,8 +158,13 @@ public final class CounterClient implements Closeable {
     try {
       return client.io().sendReadOnly(CounterCommand.GET.getMessage(), server);
     } catch (IOException e) {
-      System.err.println("Failed read-only request");
-      return RaftClientReply.newBuilder().setSuccess(false).build();
+      System.err.println("Failed read-only request from " + server + ": " + e.getMessage());
+      return RaftClientReply.newBuilder()
+          .setClientId(client.getId())
+          .setServerId(server)
+          .setGroupId(Constants.RAFT_GROUP.getGroupId())
+          .setSuccess(false)
+          .build();
     }
   }
 
