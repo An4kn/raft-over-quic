@@ -1,0 +1,21 @@
+# Katalogi danych węzłów — nie są potrzebne do builda
+n0/
+n1/
+n2/
+
+# Logi
+*.log
+
+# Artefakty builda z hosta — Maven w Dockerze i tak je przebuduje
+target/
+**/target/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+*.iml
+.vscode/
+

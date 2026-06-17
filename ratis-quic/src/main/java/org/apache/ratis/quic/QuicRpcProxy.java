@@ -65,6 +65,8 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -85,7 +87,19 @@ public class QuicRpcProxy implements Closeable {
 
   public static final Logger LOG = LoggerFactory.getLogger(QuicRpcProxy.class);
 
+  /** Max wait for a single QUIC connect attempt. Kept short so a dead peer fails fast
+   *  without blocking the calling thread (LogAppender or client). */
+  private static final long CONNECT_TIMEOUT_MS = 1_000;
+
   private static final long RECONNECT_DELAY_MS = 200;
+
+  /** Dedicated thread for reconnect attempts — must NOT be the Netty event loop. */
+  private static final ScheduledExecutorService RECONNECT_EXECUTOR =
+      Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "QuicRpcProxy-reconnect");
+        t.setDaemon(true);
+        return t;
+      });
 
   // ---- PeerMap ------------------------------------------------------------
 
@@ -209,6 +223,17 @@ public class QuicRpcProxy implements Closeable {
       final long callId = getCallIdFromRequest(request);
       pending.put(callId, future);
 
+      final java.util.concurrent.ScheduledFuture<?> timer =
+          streamChannel.eventLoop().schedule(() -> {
+            if (pending.remove(callId, future)) {
+              future.completeExceptionally(
+                  new org.apache.ratis.protocol.exceptions.TimeoutIOException(
+                      "Request " + callId + " to " + peer + " timed out"));
+            }
+          }, requestTimeout.getDuration(), requestTimeout.getUnit());
+
+      future.whenComplete((r, t) -> timer.cancel(false));
+
       streamChannel.writeAndFlush(request).addListener(cf -> {
         if (!cf.isSuccess()) {
           if (pending.remove(callId, future)) {
@@ -231,8 +256,6 @@ public class QuicRpcProxy implements Closeable {
 
   private final RaftPeer peer;
   private final TimeDuration requestTimeout;
-  private final EventLoopGroup group;
-  private final QuicSslContext sslCtx;
 
   /** Underlying UDP socket — reused across reconnects. */
   private final Channel udpChannel;
@@ -248,11 +271,9 @@ public class QuicRpcProxy implements Closeable {
   // ---- Construction -------------------------------------------------------
 
   QuicRpcProxy(RaftPeer peer, RaftProperties properties,
-      EventLoopGroup group, QuicSslContext sslCtx) throws InterruptedException {
+      EventLoopGroup group, QuicSslContext sslCtx) throws InterruptedException, IOException {
     this.peer           = peer;
     this.requestTimeout = RaftClientConfigKeys.Rpc.requestTimeout(properties);
-    this.group          = group;
-    this.sslCtx         = sslCtx;
 
     final ChannelHandler clientCodec = new QuicClientCodecBuilder()
         .sslContext(sslCtx)
@@ -263,6 +284,7 @@ public class QuicRpcProxy implements Closeable {
         .initialMaxStreamsBidirectional(100)
         .build();
 
+    // Assign before connect() so we can close on failure (no resource leak).
     this.udpChannel = new Bootstrap()
         .group(group)
         .channel(NioDatagramChannel.class)
@@ -271,7 +293,14 @@ public class QuicRpcProxy implements Closeable {
         .sync()
         .channel();
 
-    connectionRef.set(connect());
+    try {
+      connectionRef.set(connect());
+    } catch (Throwable t) {
+      udpChannel.close();
+      if (t instanceof IOException) throw (IOException) t;
+      if (t instanceof InterruptedException) throw (InterruptedException) t;
+      throw new IOException("Failed to connect to " + peer, t);
+    }
   }
 
   /**
@@ -279,20 +308,29 @@ public class QuicRpcProxy implements Closeable {
    * persistent streams on top of it.  Called on first connect and on every
    * reconnect.
    */
-  private Connection connect() throws InterruptedException {
+  private Connection connect() throws InterruptedException, IOException {
     final InetSocketAddress remoteAddr = NetUtils.createSocketAddr(peer.getAddress());
 
-    final QuicChannel qc = QuicChannel.newBootstrap(udpChannel)
-        .remoteAddress(remoteAddr)
-        .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
-          @Override
-          protected void initChannel(QuicStreamChannel ch) {
-            ch.close(); // server-initiated streams not expected
-          }
-        })
-        .connect()
-        .sync()
-        .getNow();
+    final io.netty.util.concurrent.Future<QuicChannel> connectFuture =
+        QuicChannel.newBootstrap(udpChannel)
+            .remoteAddress(remoteAddr)
+            .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
+              @Override
+              protected void initChannel(QuicStreamChannel ch) {
+                ch.close(); // server-initiated streams not expected
+              }
+            })
+            .connect();
+
+    if (!connectFuture.await(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+      connectFuture.cancel(true);
+      throw new AlreadyClosedException("QUIC connect to " + peer + " timed out after " + CONNECT_TIMEOUT_MS + "ms");
+    }
+    if (!connectFuture.isSuccess()) {
+      throw new AlreadyClosedException("QUIC connect to " + peer + " failed: "
+          + connectFuture.cause());
+    }
+    final QuicChannel qc = connectFuture.getNow();
 
     final StreamHandler aeH  = new StreamHandler();
     final StreamHandler hbH  = new StreamHandler();
@@ -305,44 +343,6 @@ public class QuicRpcProxy implements Closeable {
     final QuicStreamChannel rv = openStream(qc, QuicRpcService.TAG_REQUEST_VOTE,     rvH);
 
     return new Connection(qc, ae, hb, is, rv, aeH, hbH, isH, rvH);
-  }
-
-  // ---- Reconnect logic ----------------------------------------------------
-
-  /**
-   * Triggered by {@link StreamHandler#channelInactive} when any persistent
-   * stream dies.  Only one reconnect attempt runs at a time.
-   */
-  private void scheduleReconnect() {
-    if (closed) {
-      return;
-    }
-    if (!reconnecting.compareAndSet(false, true)) {
-      return; // another stream already triggered reconnect
-    }
-    final Connection old = connectionRef.getAndSet(null);
-    if (old != null) {
-      LOG.warn("{}: QUIC connection lost — reconnecting in {}ms", peer, RECONNECT_DELAY_MS);
-      old.failAll(new AlreadyClosedException("Reconnecting to " + peer));
-      old.quicChannel.close();
-    }
-    group.schedule(this::doReconnect, RECONNECT_DELAY_MS, TimeUnit.MILLISECONDS);
-  }
-
-  private void doReconnect() {
-    if (closed) {
-      reconnecting.set(false);
-      return;
-    }
-    try {
-      final Connection conn = connect();
-      connectionRef.set(conn);
-      reconnecting.set(false);
-      LOG.info("{}: reconnected successfully", peer);
-    } catch (Exception e) {
-      LOG.warn("{}: reconnect failed, retrying in 1s", peer, e);
-      group.schedule(this::doReconnect, 1_000, TimeUnit.MILLISECONDS);
-    }
   }
 
   // ---- Stream helpers -----------------------------------------------------
@@ -374,6 +374,36 @@ public class QuicRpcProxy implements Closeable {
             p.addLast(handler);
           }
         }).sync().getNow();
+  }
+
+  // ---- Reconnect logic ----------------------------------------------------
+
+  private void scheduleReconnect() {
+    if (closed) return;
+    if (!reconnecting.compareAndSet(false, true)) return;
+    final Connection old = connectionRef.getAndSet(null);
+    if (old != null) {
+      LOG.warn("{}: QUIC connection lost — reconnecting in {}ms", peer, RECONNECT_DELAY_MS);
+      old.failAll(new AlreadyClosedException("Reconnecting to " + peer));
+      old.quicChannel.close();
+    }
+    RECONNECT_EXECUTOR.schedule(this::doReconnect, RECONNECT_DELAY_MS, TimeUnit.MILLISECONDS);
+  }
+
+  private void doReconnect() {
+    if (closed) {
+      reconnecting.set(false);
+      return;
+    }
+    try {
+      final Connection conn = connect();
+      connectionRef.set(conn);
+      reconnecting.set(false);
+      LOG.info("{}: reconnected successfully", peer);
+    } catch (Exception e) {
+      LOG.warn("{}: reconnect failed, retrying in 1s", peer, e);
+      RECONNECT_EXECUTOR.schedule(this::doReconnect, 1_000, TimeUnit.MILLISECONDS);
+    }
   }
 
   // ---- Public API ---------------------------------------------------------

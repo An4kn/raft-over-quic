@@ -89,10 +89,11 @@ public final class CounterClient implements Closeable {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
       // Servers use SelfSignedCertificate by default; skip verification.
       QuicConfigKeys.Client.setTlsInsecure(properties, true);
-      // QUIC over UDP has no immediate "connection refused" like TCP — when the leader dies,
-      // requests sit until the per-request timeout fires. Shorten it so failover is fast.
+      // 2 s gives room for QUIC handshake + request round-trip without spurious retries.
+      // Dead-peer detection is handled by maxIdleTimeout(2 s) in QuicRpcProxy, not by
+      // keeping this timeout short.
       RaftClientConfigKeys.Rpc.setRequestTimeout(properties,
-          TimeDuration.valueOf(500, java.util.concurrent.TimeUnit.MILLISECONDS));
+          TimeDuration.valueOf(2_000, java.util.concurrent.TimeUnit.MILLISECONDS));
     } else {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
       final TlsConf tlsConf = new TlsConf.Builder()

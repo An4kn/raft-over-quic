@@ -1,0 +1,99 @@
+# Docker Compose harness for the Raft counter benchmark.
+#
+# Usage:
+#   TRANSPORT=quic  docker compose -f docker/docker-compose.yml up --build -d
+#   TRANSPORT=netty docker compose -f docker/docker-compose.yml up --build -d
+
+services:
+
+  n0:
+    image: raft-counter
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    hostname: n0
+    container_name: n0
+    environment:
+      PEER_INDEX: "0"
+      TRANSPORT: "${TRANSPORT:-quic}"
+      RATIS_EXAMPLE_CONF: /conf/conf-docker.properties
+    volumes:
+      - n0-data:/app/n0
+      - ./conf-docker.properties:/conf/conf-docker.properties:ro
+    ports:
+      - "10024:10024"
+      - "10024:10024/udp"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - raft-net
+
+  n1:
+    image: raft-counter
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    hostname: n1
+    container_name: n1
+    environment:
+      PEER_INDEX: "1"
+      TRANSPORT: "${TRANSPORT:-quic}"
+      RATIS_EXAMPLE_CONF: /conf/conf-docker.properties
+    volumes:
+      - n1-data:/app/n1
+      - ./conf-docker.properties:/conf/conf-docker.properties:ro
+    ports:
+      - "10124:10124"
+      - "10124:10124/udp"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - raft-net
+
+  n2:
+    image: raft-counter
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    hostname: n2
+    container_name: n2
+    environment:
+      PEER_INDEX: "2"
+      TRANSPORT: "${TRANSPORT:-quic}"
+      RATIS_EXAMPLE_CONF: /conf/conf-docker.properties
+    volumes:
+      - n2-data:/app/n2
+      - ./conf-docker.properties:/conf/conf-docker.properties:ro
+    ports:
+      - "11124:11124"
+      - "11124:11124/udp"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - raft-net
+
+  client:
+    image: raft-counter
+    hostname: client
+    container_name: client
+    environment:
+      TRANSPORT: "${TRANSPORT:-quic}"
+      RATIS_EXAMPLE_CONF: /conf/conf-docker.properties
+    volumes:
+      - ./conf-docker.properties:/conf/conf-docker.properties:ro
+    networks:
+      - raft-net
+    entrypoint: ["tail", "-f", "/dev/null"]
+    depends_on:
+      - n0
+      - n1
+      - n2
+
+volumes:
+  n0-data:
+  n1-data:
+  n2-data:
+
+networks:
+  raft-net:
+    driver: bridge
