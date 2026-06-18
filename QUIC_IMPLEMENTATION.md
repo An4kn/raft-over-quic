@@ -669,3 +669,61 @@ CounterClient                                       QuicRpcService
 - Dodanie metryk (Prometheus/Dropwizard) analogicznie do `NettyServerStreamRpcMetrics`
 - 0-RTT reconnect — QUIC pozwala wznowić sesję bez pełnego handshake po niedawnym rozłączeniu
 - Konfigurowalny `maxIdleTimeout` i `initialMaxStreamsBidirectional` przez `QuicConfigKeys`
+
+java -Dlog4j.configuration=file:ratis-examples/src/main/resources/log4j.properties \
+  -cp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar \
+  org.apache.ratis.examples.counter.server.CounterServer 0 --quic
+
+# instalacja
+mvn install -pl ratis-quic,ratis-examples -Dmaven.test.skip=true \
+  -Dos.detected.classifier=osx-aarch_64  
+# Terminal 1
+java -Dlog4j.configuration=file:ratis-examples/src/main/resources/log4j.properties \
+  -cp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar \
+  org.apache.ratis.examples.counter.server.CounterServer 0 --quic
+# Terminal 2
+java -Dlog4j.configuration=file:ratis-examples/src/main/resources/log4j.properties \
+  -cp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar \
+  org.apache.ratis.examples.counter.server.CounterServer 1 --quic
+
+# Terminal 3
+java -Dlog4j.configuration=file:ratis-examples/src/main/resources/log4j.properties \
+  -cp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar \
+  org.apache.ratis.examples.counter.server.CounterServer 2 --quic
+
+
+# Dododnie warotsc
+
+java -cp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 1 IO --quic
+
+java -cp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 0 IO --quic
+
+# MUSZE NA TYM DOCKERZE PRZETESTOWAC ALE MASAKRA GENRALNIE
+
+
+# 1 przesttesiowanie netty jak dziala
+  ![alt text](image.png)
+to sie pojawia tylko przez to ze mamy doczynienia z tym ze nei wsyztswekei zainicjowalismy
+# 2 quic przetetsowanie
+szybsze polaczoenei , migreacja polaczenia oraz wielestrumineiu
+deeprereaserach nioech wytlumacxzy
+
+# test 1
+awaria followera nie dziala
+keepalive problerm 
+RST - local hsot falga tcp na tynm
+
+# test 2 
+
+# czy tls dziala poprawnie
+
+docker compose -f docker/docker-compose.yml logs n0 n1 n2 | grep becomeLeader | tail -3
+# np. wyniki: n1 jest liderem
+docker compose -f docker/docker-compose.yml exec n1 \
+  sh -c "iptables -A INPUT -j DROP && iptables -A OUTPUT -j DROP"
+docker compose -f docker/docker-compose.yml exec client \
+  java -cp /app/ratis-examples.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 5 IO
+docker compose -f docker/docker-compose.yml exec n1 iptables -F

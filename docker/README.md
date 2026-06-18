@@ -37,6 +37,10 @@ docker compose -f docker/docker-compose.yml logs n0
 ```
 
 ---
+# bez przepudbowy
+docker compose -f docker/docker-compose.yml down
+TRANSPORT=netty docker compose -f docker/docker-compose.yml up -d
+
 
 ## Krok 2 — uruchom klienta
 
@@ -66,6 +70,7 @@ docker compose -f docker/docker-compose.yml exec client \
 docker compose -f docker/docker-compose.yml exec n2 iptables -A INPUT  -j DROP
 docker compose -f docker/docker-compose.yml exec n2 iptables -A OUTPUT -j DROP
 ```
+docker compose -f docker/docker-compose.yml exec n2 sh -c "iptables -A INPUT -j DROP && iptables -A OUTPUT -j DROP"
 
 ### Zmierz czas otrząśnięcia klienta
 
@@ -135,3 +140,45 @@ raft exec client java -cp /app/ratis-examples.jar \
   org.apache.ratis.examples.counter.client.CounterClient 10 IO --quic
 raft down -v
 ```
+
+docker compose -f docker/docker-compose.yml exec client \
+  java -cp /app/ratis-examples.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 5 IO
+
+
+
+  docker compose -f docker/docker-compose.yml logs n0 n1 n2 | grep becomeLeader | tail -3
+# np. wyniki: n1 jest liderem
+docker compose -f docker/docker-compose.yml exec n1 \
+  sh -c "iptables -A INPUT -j DROP && iptables -A OUTPUT -j DROP"
+docker compose -f docker/docker-compose.yml exec client \
+  java -cp /app/ratis-examples.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 5 IO
+docker compose -f docker/docker-compose.yml exec n1 iptables -F
+
+
+# quic
+docker compose -f docker/docker-compose.yml down -v
+TRANSPORT=quic docker compose -f docker/docker-compose.yml up -d
+zmiana na qiuci
+
+# baseline
+docker compose -f docker/docker-compose.yml exec client \
+  java -cp /app/ratis-examples.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 5 IO --quic
+
+# awaria followera (np. n2)
+docker compose -f docker/docker-compose.yml exec n2 iptables -A INPUT -j DROP
+docker compose -f docker/docker-compose.yml exec n2 iptables -A OUTPUT -j DROP
+docker compose -f docker/docker-compose.yml exec client \
+  java -cp /app/ratis-examples.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 5 IO --quic
+docker compose -f docker/docker-compose.yml exec n2 iptables -F
+
+# awaria lidera (sprawdź najpierw kto jest liderem z logów)
+docker compose -f docker/docker-compose.yml exec n1 iptables -A INPUT -j DROP
+docker compose -f docker/docker-compose.yml exec n1 iptables -A OUTPUT -j DROP
+docker compose -f docker/docker-compose.yml exec client \
+  java -cp /app/ratis-examples.jar \
+  org.apache.ratis.examples.counter.client.CounterClient 5 IO --quic
+docker compose -f docker/docker-compose.yml exec n1 iptables -F

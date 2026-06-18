@@ -87,9 +87,8 @@ public class QuicRpcProxy implements Closeable {
 
   public static final Logger LOG = LoggerFactory.getLogger(QuicRpcProxy.class);
 
-  /** Max wait for a single QUIC connect attempt. Kept short so a dead peer fails fast
-   *  without blocking the calling thread (LogAppender or client). */
-  private static final long CONNECT_TIMEOUT_MS = 1_000;
+  /** Max wait for a single QUIC connect attempt. */
+  private static final long CONNECT_TIMEOUT_MS = 300;
 
   private static final long RECONNECT_DELAY_MS = 200;
 
@@ -180,8 +179,15 @@ public class QuicRpcProxy implements Closeable {
 
   class StreamHandler extends SimpleChannelInboundHandler<RaftNettyServerReplyProto> {
 
+    /** True for the four long-lived per-connection streams (ae/hb/is/rv).
+     *  False for ephemeral per-request streams opened by sendOnNewStream(). */
+    private final boolean persistent;
     private final Map<Long, CompletableFuture<RaftNettyServerReplyProto>> pending =
         new ConcurrentHashMap<>();
+
+    StreamHandler(boolean persistent) {
+      this.persistent = persistent;
+    }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx,
@@ -211,8 +217,15 @@ public class QuicRpcProxy implements Closeable {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+      final boolean hadPending = !pending.isEmpty();
       failAll(new AlreadyClosedException("Stream to " + peer + " is inactive"));
-      scheduleReconnect();
+      // Reconnect only when this closure disrupted in-flight requests.
+      // Idle persistent streams closing (e.g. QUIC maxIdleTimeout) must NOT trigger
+      // a storm — connection-loss for idle streams is detected by the request-timeout
+      // timer in send() which already calls scheduleReconnect().
+      if (hadPending) {
+        scheduleReconnect();
+      }
       super.channelInactive(ctx);
     }
 
@@ -229,6 +242,9 @@ public class QuicRpcProxy implements Closeable {
               future.completeExceptionally(
                   new org.apache.ratis.protocol.exceptions.TimeoutIOException(
                       "Request " + callId + " to " + peer + " timed out"));
+              // Treat a request timeout as a dead connection — close and reconnect
+              // so the next call fails fast rather than retrying the same dead peer.
+              scheduleReconnect();
             }
           }, requestTimeout.getDuration(), requestTimeout.getUnit());
 
@@ -256,9 +272,12 @@ public class QuicRpcProxy implements Closeable {
 
   private final RaftPeer peer;
   private final TimeDuration requestTimeout;
+  private final QuicSslContext sslCtx;
+  private final EventLoopGroup group;
 
-  /** Underlying UDP socket — reused across reconnects. */
-  private final Channel udpChannel;
+  /** Current active UDP socket. Replaced on every connect attempt so that a
+   *  failed/cancelled handshake never leaves stale codec state behind. */
+  private volatile Channel udpChannel;
 
   /** Current live connection; null while reconnecting. */
   private final AtomicReference<Connection> connectionRef = new AtomicReference<>();
@@ -274,33 +293,41 @@ public class QuicRpcProxy implements Closeable {
       EventLoopGroup group, QuicSslContext sslCtx) throws InterruptedException, IOException {
     this.peer           = peer;
     this.requestTimeout = RaftClientConfigKeys.Rpc.requestTimeout(properties);
+    this.sslCtx         = sslCtx;
+    this.group          = group;
 
-    final ChannelHandler clientCodec = new QuicClientCodecBuilder()
+    // Try connecting synchronously so the proxy is ready before the first sendAsync().
+    // If the peer is unreachable (partitioned), do NOT throw — schedule an async retry
+    // and return normally. sendAsync() returns "Not connected" while reconnecting,
+    // so Ratis can route to a live peer instead of crashing.
+    try {
+      connectionRef.set(connect());
+    } catch (Exception e) {
+      LOG.warn("{}: initial connect failed ({}), will retry", peer, e.getMessage());
+      reconnecting.set(true);
+      RECONNECT_EXECUTOR.schedule(this::doReconnect, 1_000, TimeUnit.MILLISECONDS);
+    }
+  }
+
+  /** Creates a fresh NIO-UDP socket with its own QUIC codec instance.
+   *  Called before every connection attempt so that a cancelled/failed prior attempt
+   *  cannot leave stale quiche state in the codec. */
+  private Channel newUdpChannel() throws InterruptedException {
+    final ChannelHandler codec = new QuicClientCodecBuilder()
         .sslContext(sslCtx)
-        .maxIdleTimeout(0, TimeUnit.MILLISECONDS)
+        .maxIdleTimeout(30_000, TimeUnit.MILLISECONDS)
         .initialMaxData(10_000_000)
         .initialMaxStreamDataBidirectionalLocal(1_000_000)
         .initialMaxStreamDataBidirectionalRemote(1_000_000)
         .initialMaxStreamsBidirectional(100)
         .build();
-
-    // Assign before connect() so we can close on failure (no resource leak).
-    this.udpChannel = new Bootstrap()
+    return new Bootstrap()
         .group(group)
         .channel(NioDatagramChannel.class)
-        .handler(clientCodec)
+        .handler(codec)
         .bind(0)
         .sync()
         .channel();
-
-    try {
-      connectionRef.set(connect());
-    } catch (Throwable t) {
-      udpChannel.close();
-      if (t instanceof IOException) throw (IOException) t;
-      if (t instanceof InterruptedException) throw (InterruptedException) t;
-      throw new IOException("Failed to connect to " + peer, t);
-    }
   }
 
   /**
@@ -311,8 +338,11 @@ public class QuicRpcProxy implements Closeable {
   private Connection connect() throws InterruptedException, IOException {
     final InetSocketAddress remoteAddr = NetUtils.createSocketAddr(peer.getAddress());
 
+    // Fresh UDP channel + QUIC codec per attempt — avoids stale quiche state after cancel().
+    final Channel freshUdp = newUdpChannel();
+
     final io.netty.util.concurrent.Future<QuicChannel> connectFuture =
-        QuicChannel.newBootstrap(udpChannel)
+        QuicChannel.newBootstrap(freshUdp)
             .remoteAddress(remoteAddr)
             .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
               @Override
@@ -324,18 +354,26 @@ public class QuicRpcProxy implements Closeable {
 
     if (!connectFuture.await(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
       connectFuture.cancel(true);
+      freshUdp.close();
       throw new AlreadyClosedException("QUIC connect to " + peer + " timed out after " + CONNECT_TIMEOUT_MS + "ms");
     }
     if (!connectFuture.isSuccess()) {
+      freshUdp.close();
       throw new AlreadyClosedException("QUIC connect to " + peer + " failed: "
           + connectFuture.cause());
     }
+
+    // Handshake succeeded — swap in the new channel and discard the old one.
+    final Channel old = udpChannel;
+    udpChannel = freshUdp;
+    if (old != null) old.close();
+
     final QuicChannel qc = connectFuture.getNow();
 
-    final StreamHandler aeH  = new StreamHandler();
-    final StreamHandler hbH  = new StreamHandler();
-    final StreamHandler isH  = new StreamHandler();
-    final StreamHandler rvH  = new StreamHandler();
+    final StreamHandler aeH  = new StreamHandler(true);
+    final StreamHandler hbH  = new StreamHandler(true);
+    final StreamHandler isH  = new StreamHandler(true);
+    final StreamHandler rvH  = new StreamHandler(true);
 
     final QuicStreamChannel ae = openStream(qc, QuicRpcService.TAG_APPEND_ENTRIES,   aeH);
     final QuicStreamChannel hb = openStream(qc, QuicRpcService.TAG_HEARTBEAT,        hbH);
@@ -478,7 +516,7 @@ public class QuicRpcProxy implements Closeable {
       return result;
     }
     try {
-      final StreamHandler ephemeralHandler = new StreamHandler();
+      final StreamHandler ephemeralHandler = new StreamHandler(false);
       final QuicStreamChannel ch = openStream(
           conn.quicChannel, QuicRpcService.TAG_CLIENT_REQUEST, ephemeralHandler);
       ephemeralHandler.send(ch, proto).whenComplete((reply, ex) -> {
@@ -576,7 +614,8 @@ public class QuicRpcProxy implements Closeable {
     if (conn != null) {
       conn.quicChannel.close();
     }
-    udpChannel.close();
+    final Channel ch = udpChannel;
+    if (ch != null) ch.close();
   }
 
   // ---- Helpers ------------------------------------------------------------
