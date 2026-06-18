@@ -96,6 +96,8 @@ public final class CounterClient implements Closeable {
           TimeDuration.valueOf(2_000, java.util.concurrent.TimeUnit.MILLISECONDS));
     } else {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
+      RaftClientConfigKeys.Rpc.setRequestTimeout(properties,
+          TimeDuration.valueOf(2_000, java.util.concurrent.TimeUnit.MILLISECONDS));
       final TlsConf tlsConf = new TlsConf.Builder()
           .setName("client")
           .setPrivateKey(new PrivateKeyConf(new File("ratis-test/src/test/resources/ssl/client.pem")))
