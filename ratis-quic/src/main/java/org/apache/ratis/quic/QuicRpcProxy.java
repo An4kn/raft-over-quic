@@ -353,8 +353,7 @@ public class QuicRpcProxy implements Closeable {
             .connect();
 
     if (!connectFuture.await(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-      connectFuture.cancel(true);
-      freshUdp.close();
+      freshUdp.close(); // causes the pending connect future to fail naturally, avoiding cancel() race
       throw new AlreadyClosedException("QUIC connect to " + peer + " timed out after " + CONNECT_TIMEOUT_MS + "ms");
     }
     if (!connectFuture.isSuccess()) {

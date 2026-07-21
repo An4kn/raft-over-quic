@@ -244,6 +244,8 @@ public final class CounterClient implements Closeable {
       } finally {
         executor.shutdown();
       }
+      // Ratis shutdown hooks block System.exit; halt bypasses them entirely.
+      Runtime.getRuntime().halt(0);
     } catch (Throwable e) {
       e.printStackTrace();
       System.err.println();
@@ -258,7 +260,7 @@ public final class CounterClient implements Closeable {
       System.err.println("       IO       : use the BlockingApi");
       System.err.println("       CLIENTS  : the number of clients (default is 1)");
       System.err.println("       --quic   : use QUIC transport (default: Netty/TCP)");
-      System.exit(1);
+      Runtime.getRuntime().halt(1);
     }
   }
 }
