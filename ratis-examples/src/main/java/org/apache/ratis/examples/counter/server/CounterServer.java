@@ -86,8 +86,12 @@ public final class CounterServer implements Closeable {
     if (useQuic) {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
       QuicConfigKeys.Server.setPort(properties, port);
-      // Server uses SelfSignedCertificate by default; skip verification on outgoing P2P connections.
-      QuicConfigKeys.Client.setTlsInsecure(properties, true);
+
+      // Same CA-signed certs as Netty, so both transports do a real chain
+      // verification handshake instead of skipping it — keeps the comparison fair.
+      QuicConfigKeys.Server.setTlsCert(properties, "ratis-test/src/test/resources/ssl/server.crt");
+      QuicConfigKeys.Server.setTlsKey(properties, "ratis-test/src/test/resources/ssl/server.pem");
+      QuicConfigKeys.Client.setTlsCaCert(properties, "ratis-test/src/test/resources/ssl/ca.crt");
     } else {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.NETTY);
       NettyConfigKeys.Server.setPort(properties, port);

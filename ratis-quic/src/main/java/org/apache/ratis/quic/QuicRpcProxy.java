@@ -315,7 +315,7 @@ public class QuicRpcProxy implements Closeable {
   private Channel newUdpChannel() throws InterruptedException {
     final ChannelHandler codec = new QuicClientCodecBuilder()
         .sslContext(sslCtx)
-        .maxIdleTimeout(30_000, TimeUnit.MILLISECONDS)
+        .maxIdleTimeout(0, TimeUnit.MILLISECONDS)
         .initialMaxData(10_000_000)
         .initialMaxStreamDataBidirectionalLocal(1_000_000)
         .initialMaxStreamDataBidirectionalRemote(1_000_000)

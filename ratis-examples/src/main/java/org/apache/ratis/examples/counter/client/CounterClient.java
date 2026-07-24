@@ -87,8 +87,9 @@ public final class CounterClient implements Closeable {
 
     if (useQuic) {
       RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.QUIC);
-      // Servers use SelfSignedCertificate by default; skip verification.
-      QuicConfigKeys.Client.setTlsInsecure(properties, true);
+      // Same CA-signed cert as Netty, so both transports do a real chain
+      // verification handshake instead of skipping it — keeps the comparison fair.
+      QuicConfigKeys.Client.setTlsCaCert(properties, "ratis-test/src/test/resources/ssl/ca.crt");
       // 2 s gives room for QUIC handshake + request round-trip without spurious retries.
       // Dead-peer detection is handled by maxIdleTimeout(2 s) in QuicRpcProxy, not by
       // keeping this timeout short.
