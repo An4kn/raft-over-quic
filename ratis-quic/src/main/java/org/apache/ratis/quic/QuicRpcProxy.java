@@ -146,25 +146,31 @@ public class QuicRpcProxy implements Closeable {
     final QuicStreamChannel heartbeatStream;
     final QuicStreamChannel installSnapshotStream;
     final QuicStreamChannel requestVoteStream;
+    final QuicStreamChannel clientRequestStream;
     final StreamHandler appendEntriesHandler;
     final StreamHandler heartbeatHandler;
     final StreamHandler installSnapshotHandler;
     final StreamHandler requestVoteHandler;
+    final StreamHandler clientRequestHandler;
 
     Connection(QuicChannel qc,
         QuicStreamChannel ae, QuicStreamChannel hb,
         QuicStreamChannel is, QuicStreamChannel rv,
+        QuicStreamChannel cr,
         StreamHandler aeH, StreamHandler hbH,
-        StreamHandler isH, StreamHandler rvH) {
+        StreamHandler isH, StreamHandler rvH,
+        StreamHandler crH) {
       this.quicChannel           = qc;
       this.appendEntriesStream   = ae;
       this.heartbeatStream       = hb;
       this.installSnapshotStream = is;
       this.requestVoteStream     = rv;
+      this.clientRequestStream   = cr;
       this.appendEntriesHandler  = aeH;
       this.heartbeatHandler      = hbH;
       this.installSnapshotHandler = isH;
       this.requestVoteHandler    = rvH;
+      this.clientRequestHandler  = crH;
     }
 
     void failAll(Throwable cause) {
@@ -172,6 +178,7 @@ public class QuicRpcProxy implements Closeable {
       heartbeatHandler.failAll(cause);
       installSnapshotHandler.failAll(cause);
       requestVoteHandler.failAll(cause);
+      clientRequestHandler.failAll(cause);
     }
   }
 
@@ -373,13 +380,18 @@ public class QuicRpcProxy implements Closeable {
     final StreamHandler hbH  = new StreamHandler(true);
     final StreamHandler isH  = new StreamHandler(true);
     final StreamHandler rvH  = new StreamHandler(true);
+    final StreamHandler crH  = new StreamHandler(true);
 
     final QuicStreamChannel ae = openStream(qc, QuicRpcService.TAG_APPEND_ENTRIES,   aeH);
     final QuicStreamChannel hb = openStream(qc, QuicRpcService.TAG_HEARTBEAT,        hbH);
     final QuicStreamChannel is = openStream(qc, QuicRpcService.TAG_INSTALL_SNAPSHOT, isH);
     final QuicStreamChannel rv = openStream(qc, QuicRpcService.TAG_REQUEST_VOTE,     rvH);
+    // Persistent stream for external client requests, multiplexed by callId — mirrors
+    // the single reused channel that NettyRpcProxy uses. Replaces the previous
+    // stream-per-request model (sendOnNewStream) that could hang on createStream().sync().
+    final QuicStreamChannel cr = openStream(qc, QuicRpcService.TAG_CLIENT_REQUEST,   crH);
 
-    return new Connection(qc, ae, hb, is, rv, aeH, hbH, isH, rvH);
+    return new Connection(qc, ae, hb, is, rv, cr, aeH, hbH, isH, rvH, crH);
   }
 
   // ---- Stream helpers -----------------------------------------------------
@@ -479,7 +491,12 @@ public class QuicRpcProxy implements Closeable {
         handler = conn.requestVoteHandler;
         break;
       default:
-        return sendOnNewStream(proto);
+        // External client requests (RaftClientRequest, group/config/etc.) all share the
+        // persistent client-request stream, multiplexed by callId — same model as
+        // NettyRpcProxy's single reused channel.
+        stream  = conn.clientRequestStream;
+        handler = conn.clientRequestHandler;
+        break;
     }
     return handler.send(stream, proto);
   }
@@ -502,35 +519,6 @@ public class QuicRpcProxy implements Closeable {
       throw new org.apache.ratis.protocol.exceptions.TimeoutIOException(
           e.getMessage(), e);
     }
-  }
-
-  private CompletableFuture<RaftNettyServerReplyProto> sendOnNewStream(
-      RaftNettyServerRequestProto proto) {
-    final CompletableFuture<RaftNettyServerReplyProto> result =
-        new CompletableFuture<>();
-    final Connection conn = connectionRef.get();
-    if (conn == null) {
-      result.completeExceptionally(
-          new IOException("Not connected to " + peer + " (reconnecting)"));
-      return result;
-    }
-    try {
-      final StreamHandler ephemeralHandler = new StreamHandler(false);
-      final QuicStreamChannel ch = openStream(
-          conn.quicChannel, QuicRpcService.TAG_CLIENT_REQUEST, ephemeralHandler);
-      ephemeralHandler.send(ch, proto).whenComplete((reply, ex) -> {
-        if (ex != null) {
-          result.completeExceptionally(ex);
-        } else {
-          result.complete(reply);
-        }
-        ch.close();
-      });
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      result.completeExceptionally(e);
-    }
-    return result;
   }
 
   public CompletableFuture<ReadIndexReplyProto> readIndexAsync(
