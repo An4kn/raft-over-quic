@@ -232,9 +232,18 @@ public class CounterStateMachine extends BaseStateMachine {
    */
   @Override
   public CompletableFuture<Message> query(Message request) {
-    final String command = request.getContent().toStringUtf8();
-    if (!CounterCommand.GET.matches(command)) {
-      return JavaUtils.completeExceptionally(new IllegalArgumentException("Invalid Command: " + command));
+    final ByteString content = request.getContent();
+    if (!CounterCommand.GET.matches(content)) {
+      return JavaUtils.completeExceptionally(new IllegalArgumentException("Invalid Command: " + content));
+    }
+    // "GET" + 4-byte size (benchmark) => return a zero-filled payload of that size (download).
+    // Plain "GET" (CounterClient) => return the counter value, as before.
+    final int prefixLen = CounterCommand.GET.getMessage().getContent().size();
+    if (content.size() >= prefixLen + Integer.BYTES) {
+      final int size = content.substring(prefixLen, prefixLen + Integer.BYTES)
+          .asReadOnlyByteBuffer().getInt();
+      return CompletableFuture.completedFuture(
+          Message.valueOf(ByteString.copyFrom(new byte[Math.max(0, size)])));
     }
     return CompletableFuture.completedFuture(Message.valueOf(toByteString(counter.get())));
   }

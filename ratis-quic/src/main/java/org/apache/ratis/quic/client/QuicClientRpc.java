@@ -71,7 +71,7 @@ public class QuicClientRpc extends RaftClientRpcWithProxy<QuicRpcProxy> {
   private final TimeoutExecutor scheduler = TimeoutExecutor.getInstance();
 
   public QuicClientRpc(ClientId clientId, RaftProperties properties) {
-    super(new QuicRpcProxy.PeerMap(clientId.toString(), properties));
+    super(new QuicRpcProxy.PeerMap(clientId.toString(), properties, true));
     this.clientId       = clientId;
     this.requestTimeout = RaftClientConfigKeys.Rpc.requestTimeout(properties);
   }

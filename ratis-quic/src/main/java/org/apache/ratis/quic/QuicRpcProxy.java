@@ -65,11 +65,8 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.ratis.proto.netty.NettyProtos.RaftNettyServerReplyProto.RaftNettyServerReplyCase.EXCEPTIONREPLY;
@@ -87,18 +84,14 @@ public class QuicRpcProxy implements Closeable {
 
   public static final Logger LOG = LoggerFactory.getLogger(QuicRpcProxy.class);
 
-  /** Max wait for a single QUIC connect attempt. */
-  private static final long CONNECT_TIMEOUT_MS = 300;
-
-  private static final long RECONNECT_DELAY_MS = 200;
-
-  /** Dedicated thread for reconnect attempts — must NOT be the Netty event loop. */
-  private static final ScheduledExecutorService RECONNECT_EXECUTOR =
-      Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "QuicRpcProxy-reconnect");
-        t.setDaemon(true);
-        return t;
-      });
+  /** Max wait for a single QUIC connect attempt (bounded, like Netty's
+   *  ChannelOption.CONNECT_TIMEOUT_MILLIS). connect() is synchronous: on failure it
+   *  throws and PeerProxyMap recreates the proxy on the next request — no in-proxy
+   *  async reconnect / null "reconnecting" state (that combination busy-looped into a
+   *  connection storm under load). Generous (5 s) so concurrent handshakes under load
+   *  do not spuriously fail, yet bounded so a request to a dead leader eventually fails
+   *  over instead of blocking forever. */
+  private static final long CONNECT_TIMEOUT_MS = 5000;
 
   // ---- PeerMap ------------------------------------------------------------
 
@@ -106,18 +99,25 @@ public class QuicRpcProxy implements Closeable {
 
     private final EventLoopGroup group;
 
+    /** Server-server proxy map (creates the 4 Raft-consensus streams per connection). */
     public PeerMap(String name, RaftProperties properties) {
-      this(name, properties,
+      this(name, properties, false);
+    }
+
+    /** @param clientMode true for external client connections, which only need the
+     *  single client-request stream (not the 4 server-server streams). */
+    public PeerMap(String name, RaftProperties properties, boolean clientMode) {
+      this(name, properties, clientMode,
           new NioEventLoopGroup(0,
               (java.util.concurrent.ThreadFactory) r ->
                   new Thread(r, "QuicRpcProxy-" + name + "-")));
     }
 
-    private PeerMap(String name, RaftProperties properties, EventLoopGroup group) {
+    private PeerMap(String name, RaftProperties properties, boolean clientMode, EventLoopGroup group) {
       super(name, peer -> {
         try {
           final QuicSslContext sslCtx = buildClientSslContext(properties);
-          return new QuicRpcProxy(peer, properties, group, sslCtx);
+          return new QuicRpcProxy(peer, properties, group, sslCtx, clientMode);
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
           throw IOUtils.toInterruptedIOException(
@@ -174,11 +174,13 @@ public class QuicRpcProxy implements Closeable {
     }
 
     void failAll(Throwable cause) {
-      appendEntriesHandler.failAll(cause);
-      heartbeatHandler.failAll(cause);
-      installSnapshotHandler.failAll(cause);
-      requestVoteHandler.failAll(cause);
-      clientRequestHandler.failAll(cause);
+      // Server-server handlers are null on client connections (client mode).
+      for (StreamHandler h : new StreamHandler[] {appendEntriesHandler, heartbeatHandler,
+          installSnapshotHandler, requestVoteHandler, clientRequestHandler}) {
+        if (h != null) {
+          h.failAll(cause);
+        }
+      }
     }
   }
 
@@ -224,15 +226,10 @@ public class QuicRpcProxy implements Closeable {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-      final boolean hadPending = !pending.isEmpty();
+      // Fail in-flight requests, like NettyRpcProxy.failOutstandingRequests. No in-proxy
+      // reconnect: the AlreadyClosedException is retriable, so the client's PeerProxyMap
+      // discards and recreates this proxy (fresh connect) on the next request.
       failAll(new AlreadyClosedException("Stream to " + peer + " is inactive"));
-      // Reconnect only when this closure disrupted in-flight requests.
-      // Idle persistent streams closing (e.g. QUIC maxIdleTimeout) must NOT trigger
-      // a storm — connection-loss for idle streams is detected by the request-timeout
-      // timer in send() which already calls scheduleReconnect().
-      if (hadPending) {
-        scheduleReconnect();
-      }
       super.channelInactive(ctx);
     }
 
@@ -246,12 +243,11 @@ public class QuicRpcProxy implements Closeable {
       final java.util.concurrent.ScheduledFuture<?> timer =
           streamChannel.eventLoop().schedule(() -> {
             if (pending.remove(callId, future)) {
+              // Fail the request; the retriable TimeoutIOException lets the client's
+              // PeerProxyMap discard and recreate this proxy on the next attempt.
               future.completeExceptionally(
                   new org.apache.ratis.protocol.exceptions.TimeoutIOException(
                       "Request " + callId + " to " + peer + " timed out"));
-              // Treat a request timeout as a dead connection — close and reconnect
-              // so the next call fails fast rather than retrying the same dead peer.
-              scheduleReconnect();
             }
           }, requestTimeout.getDuration(), requestTimeout.getUnit());
 
@@ -286,34 +282,30 @@ public class QuicRpcProxy implements Closeable {
    *  failed/cancelled handshake never leaves stale codec state behind. */
   private volatile Channel udpChannel;
 
-  /** Current live connection; null while reconnecting. */
+  /** Current live connection; null only after {@link #close()}. */
   private final AtomicReference<Connection> connectionRef = new AtomicReference<>();
-
-  /** Guards against concurrent/redundant reconnect attempts. */
-  private final AtomicBoolean reconnecting = new AtomicBoolean(false);
 
   private volatile boolean closed = false;
 
+  /** True for external client connections: only the client-request stream is created,
+   *  not the 4 server-server (AppendEntries/Heartbeat/InstallSnapshot/RequestVote) streams
+   *  that a client never uses. Keeps the client's handshake light (1 stream vs 5). */
+  private final boolean clientMode;
+
   // ---- Construction -------------------------------------------------------
 
-  QuicRpcProxy(RaftPeer peer, RaftProperties properties,
-      EventLoopGroup group, QuicSslContext sslCtx) throws InterruptedException, IOException {
+  QuicRpcProxy(RaftPeer peer, RaftProperties properties, EventLoopGroup group,
+      QuicSslContext sslCtx, boolean clientMode) throws InterruptedException, IOException {
     this.peer           = peer;
     this.requestTimeout = RaftClientConfigKeys.Rpc.requestTimeout(properties);
     this.sslCtx         = sslCtx;
     this.group          = group;
+    this.clientMode     = clientMode;
 
-    // Try connecting synchronously so the proxy is ready before the first sendAsync().
-    // If the peer is unreachable (partitioned), do NOT throw — schedule an async retry
-    // and return normally. sendAsync() returns "Not connected" while reconnecting,
-    // so Ratis can route to a live peer instead of crashing.
-    try {
-      connectionRef.set(connect());
-    } catch (Exception e) {
-      LOG.warn("{}: initial connect failed ({}), will retry", peer, e.getMessage());
-      reconnecting.set(true);
-      RECONNECT_EXECUTOR.schedule(this::doReconnect, 1_000, TimeUnit.MILLISECONDS);
-    }
+    // Connect synchronously, like NettyRpcProxy. If the peer is unreachable the connect
+    // throws and the exception propagates to PeerProxyMap, which recreates the proxy on
+    // the next request. No in-proxy async reconnect / null "reconnecting" state.
+    connectionRef.set(connect());
   }
 
   /** Creates a fresh NIO-UDP socket with its own QUIC codec instance.
@@ -376,20 +368,27 @@ public class QuicRpcProxy implements Closeable {
 
     final QuicChannel qc = connectFuture.getNow();
 
+    // Client connections only ever send RaftClientRequests, so they open a single
+    // client-request stream (multiplexed by callId, like NettyRpcProxy's one channel).
+    // Server-server connections additionally open the 4 Raft-consensus streams. Opening
+    // only what is needed keeps the client handshake light (1 stream vs 5), which matters
+    // under concurrency where each openStream().sync() adds serial event-loop work.
+    final StreamHandler crH  = new StreamHandler(true);
+    final QuicStreamChannel cr = openStream(qc, QuicRpcService.TAG_CLIENT_REQUEST, crH);
+
+    if (clientMode) {
+      return new Connection(qc, null, null, null, null, cr, null, null, null, null, crH);
+    }
+
     final StreamHandler aeH  = new StreamHandler(true);
     final StreamHandler hbH  = new StreamHandler(true);
     final StreamHandler isH  = new StreamHandler(true);
     final StreamHandler rvH  = new StreamHandler(true);
-    final StreamHandler crH  = new StreamHandler(true);
 
     final QuicStreamChannel ae = openStream(qc, QuicRpcService.TAG_APPEND_ENTRIES,   aeH);
     final QuicStreamChannel hb = openStream(qc, QuicRpcService.TAG_HEARTBEAT,        hbH);
     final QuicStreamChannel is = openStream(qc, QuicRpcService.TAG_INSTALL_SNAPSHOT, isH);
     final QuicStreamChannel rv = openStream(qc, QuicRpcService.TAG_REQUEST_VOTE,     rvH);
-    // Persistent stream for external client requests, multiplexed by callId — mirrors
-    // the single reused channel that NettyRpcProxy uses. Replaces the previous
-    // stream-per-request model (sendOnNewStream) that could hang on createStream().sync().
-    final QuicStreamChannel cr = openStream(qc, QuicRpcService.TAG_CLIENT_REQUEST,   crH);
 
     return new Connection(qc, ae, hb, is, rv, cr, aeH, hbH, isH, rvH, crH);
   }
@@ -425,36 +424,6 @@ public class QuicRpcProxy implements Closeable {
         }).sync().getNow();
   }
 
-  // ---- Reconnect logic ----------------------------------------------------
-
-  private void scheduleReconnect() {
-    if (closed) return;
-    if (!reconnecting.compareAndSet(false, true)) return;
-    final Connection old = connectionRef.getAndSet(null);
-    if (old != null) {
-      LOG.warn("{}: QUIC connection lost — reconnecting in {}ms", peer, RECONNECT_DELAY_MS);
-      old.failAll(new AlreadyClosedException("Reconnecting to " + peer));
-      old.quicChannel.close();
-    }
-    RECONNECT_EXECUTOR.schedule(this::doReconnect, RECONNECT_DELAY_MS, TimeUnit.MILLISECONDS);
-  }
-
-  private void doReconnect() {
-    if (closed) {
-      reconnecting.set(false);
-      return;
-    }
-    try {
-      final Connection conn = connect();
-      connectionRef.set(conn);
-      reconnecting.set(false);
-      LOG.info("{}: reconnected successfully", peer);
-    } catch (Exception e) {
-      LOG.warn("{}: reconnect failed, retrying in 1s", peer, e);
-      RECONNECT_EXECUTOR.schedule(this::doReconnect, 1_000, TimeUnit.MILLISECONDS);
-    }
-  }
-
   // ---- Public API ---------------------------------------------------------
 
   public CompletableFuture<RaftNettyServerReplyProto> sendAsync(
@@ -463,8 +432,7 @@ public class QuicRpcProxy implements Closeable {
     final Connection conn = connectionRef.get();
     if (conn == null) {
       final CompletableFuture<RaftNettyServerReplyProto> f = new CompletableFuture<>();
-      f.completeExceptionally(
-          new IOException("Not connected to " + peer + " (reconnecting)"));
+      f.completeExceptionally(new AlreadyClosedException("Proxy to " + peer + " is closed"));
       return f;
     }
 
@@ -526,8 +494,7 @@ public class QuicRpcProxy implements Closeable {
     final CompletableFuture<ReadIndexReplyProto> result = new CompletableFuture<>();
     final Connection conn = connectionRef.get();
     if (conn == null) {
-      result.completeExceptionally(
-          new IOException("Not connected to " + peer + " (reconnecting)"));
+      result.completeExceptionally(new AlreadyClosedException("Proxy to " + peer + " is closed"));
       return result;
     }
     try {

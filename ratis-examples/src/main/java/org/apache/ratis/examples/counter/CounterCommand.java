@@ -40,8 +40,11 @@ public enum CounterCommand {
     return name().equalsIgnoreCase(command);
   }
 
-  /** Does the given command string match this command? */
+  /** Does the given command bytes start with this command?
+   *  Prefix (not exact) match so an INCREMENT may carry a trailing payload
+   *  (used by the benchmark to size the request); the payload is ignored by
+   *  the state machine. */
   public boolean matches(ByteString command) {
-    return message.getContent().equals(command);
+    return command.startsWith(message.getContent());
   }
 }
