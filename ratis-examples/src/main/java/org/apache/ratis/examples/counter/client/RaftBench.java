@@ -26,6 +26,7 @@ import org.apache.ratis.examples.common.Constants;
 import org.apache.ratis.examples.counter.CounterCommand;
 import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.quic.QuicConfigKeys;
@@ -88,6 +89,11 @@ public final class RaftBench {
   /** Where readers read from. */
   enum ReadFrom { LEADER, FOLLOWERS }
 
+  /** scaling = writer/reader split, plain stale read (minIndex=0);
+   *  rywrites = same client writes to leader then reads its OWN write from a follower (minIndex=N).
+   *  rywrites requires the server flag raft.server.read.stale-read.wait.enabled=true (long-poll). */
+  enum Mode { SCALING, RYWRITES }
+
   private static Transport transport = Transport.TCP_TLS;
 
   // ---- Client construction ------------------------------------------------
@@ -134,14 +140,15 @@ public final class RaftBench {
     return Message.valueOf(CounterCommand.INCREMENT.getMessage().getContent().concat(body));
   }
 
-  /** Read request = "GET" + payloadSize(4B); the state machine replies with a
-   *  zero-filled payload of that size (the "download" direction). */
-  static Message buildRead(int payloadSize) {
-    final ByteBuffer size = ByteBuffer.allocate(Integer.BYTES);
-    size.putInt(payloadSize);
-    size.flip();
+  /** Read request = "GET" + workerId(4B) + payloadSize(4B). The state machine replies with the REAL
+   *  bytes stored for that worker (its last write), or a zero payload of that size if none yet. */
+  static Message buildRead(int workerId, int payloadSize) {
+    final ByteBuffer b = ByteBuffer.allocate(2 * Integer.BYTES);
+    b.putInt(workerId);
+    b.putInt(payloadSize);
+    b.flip();
     return Message.valueOf(
-        CounterCommand.GET.getMessage().getContent().concat(ByteString.copyFrom(size)));
+        CounterCommand.GET.getMessage().getContent().concat(ByteString.copyFrom(b)));
   }
 
   // ---- One (transport, total, payload, conn, read-from) data point --------
@@ -190,7 +197,7 @@ public final class RaftBench {
       final int id = r;
       final RaftPeerId target =
           (readFrom == ReadFrom.LEADER) ? leaderId : followers.get(r % followers.size());
-      final Message readMsg = buildRead(payloadSize);
+      final Message readMsg = buildRead(id, payloadSize);
       final Thread t = new Thread(() -> runRole(id, conn, warmup, requestsPerClient, ready, go,
           readLat, client -> client.io().sendStaleRead(readMsg, 0, target)), "bench-reader-" + r);
       t.start();
@@ -248,6 +255,88 @@ public final class RaftBench {
     void run(RaftClient client) throws IOException;
   }
 
+  // ---- read-your-writes mode ---------------------------------------------
+
+  /** Each of {@code total} workers loops (blocking, request->response->next):
+   *  write to the leader, take the committed index N = {@link RaftClientReply#getLogIndex()},
+   *  then read its OWN write from a follower with {@code minIndex=N}. With the server long-poll
+   *  flag on, the follower holds the read until it has applied N. Write and read latency are
+   *  measured separately; the read latency includes the replication catch-up (client-observed lag). */
+  static Result runBenchRywrites(int total, int payloadSize, int requestsPerClient, int warmup,
+      ConnMode conn, List<RaftPeerId> followers) throws InterruptedException {
+
+    final List<Thread> threads = new ArrayList<>(total);
+    final Map<Integer, long[]> writeLat = new ConcurrentHashMap<>();
+    final Map<Integer, long[]> readLat = new ConcurrentHashMap<>();
+    final CountDownLatch ready = new CountDownLatch(total);
+    final CountDownLatch go = new CountDownLatch(1);
+
+    for (int w = 0; w < total; w++) {
+      final int id = w;
+      final RaftPeerId follower = followers.get(w % followers.size());
+      final Thread t = new Thread(() -> runRywritesWorker(id, conn, warmup, requestsPerClient,
+          payloadSize, follower, ready, go, writeLat, readLat), "bench-ryw-" + w);
+      t.start();
+      threads.add(t);
+    }
+
+    ready.await();
+    final long start = System.nanoTime();
+    go.countDown();
+    for (Thread t : threads) {
+      t.join();
+    }
+    final long durationNanos = System.nanoTime() - start;
+
+    return new Result(total, total, total, durationNanos,
+        merge(writeLat.values()), merge(readLat.values()));
+  }
+
+  /** One read-your-writes worker: write to leader -> N -> read own write from {@code follower}. */
+  private static void runRywritesWorker(int id, ConnMode conn, int warmup, int requests,
+      int payloadSize, RaftPeerId follower, CountDownLatch ready, CountDownLatch go,
+      Map<Integer, long[]> writeBucket, Map<Integer, long[]> readBucket) {
+    final long[] wlat = new long[requests];
+    final long[] rlat = new long[requests];
+    final Message writeMsg = buildWrite(id, payloadSize);
+    final Message readMsg = buildRead(id, payloadSize);   // same worker id => reads its own write
+    // Same client writes to the leader and reads its own write from the assigned follower.
+    // minIndex=0: the follower serves its current value IMMEDIATELY (no waiting) => no latency tail.
+    // It usually already holds this worker's latest write; occasionally it is one write behind.
+    final RaftClient reused = (conn == ConnMode.B) ? newClient() : null;
+    try {
+      ready.countDown();
+      go.await();
+      final int total = warmup + requests;
+      for (int i = 0; i < total; i++) {
+        final RaftClient client = (conn == ConnMode.A) ? newClient() : reused;
+        try {
+          final long t0 = System.nanoTime();
+          client.io().send(writeMsg);                        // -> leader (consensus)
+          final long t1 = System.nanoTime();
+          client.io().sendStaleRead(readMsg, 0, follower);   // -> assigned follower, immediate
+          final long t2 = System.nanoTime();
+          if (i >= warmup) {
+            wlat[i - warmup] = t1 - t0;
+            rlat[i - warmup] = t2 - t1;
+          }
+        } finally {
+          if (conn == ConnMode.A) {
+            client.close();
+          }
+        }
+      }
+      writeBucket.put(id, wlat);
+      readBucket.put(id, rlat);
+    } catch (Exception e) {
+      System.err.printf("rywrites worker %d failed: %s%n", id, e);
+    } finally {
+      if (reused != null) {
+        try { reused.close(); } catch (IOException ignored) { }
+      }
+    }
+  }
+
   // ---- Stats --------------------------------------------------------------
 
   private static long[] merge(Iterable<long[]> arrays) {
@@ -278,11 +367,11 @@ public final class RaftBench {
   // ---- CSV / arg parsing --------------------------------------------------
 
   private static final String CSV_HEADER =
-      "transport,total,writers,readers,payload_bytes,conn,read_from,duration_s,"
+      "transport,mode,total,writers,readers,payload_bytes,conn,read_from,duration_s,"
           + "write_tput_req_s,write_MB_s,write_p50_ms,write_p99_ms,"
           + "read_tput_req_s,read_MB_s,read_p50_ms,read_p99_ms";
 
-  private static String csvRow(int payloadSize, ConnMode conn, ReadFrom readFrom, Result r) {
+  private static String csvRow(Mode mode, int payloadSize, ConnMode conn, ReadFrom readFrom, Result r) {
     final double durationS = r.durationNanos / 1e9;
     final int writes = r.writeLatNanos.length;
     final int reads = r.readLatNanos.length;
@@ -293,8 +382,8 @@ public final class RaftBench {
     final double readMB = durationS > 0
         ? (reads * (double) payloadSize) / (1024 * 1024) / durationS : 0;
     return String.format(Locale.ROOT,
-        "%s,%d,%d,%d,%d,%s,%s,%.3f,%.1f,%.2f,%.3f,%.3f,%.1f,%.2f,%.3f,%.3f",
-        transport, r.total, r.writers, r.readers, payloadSize, conn,
+        "%s,%s,%d,%d,%d,%d,%s,%s,%.3f,%.1f,%.2f,%.3f,%.3f,%.1f,%.2f,%.3f,%.3f",
+        transport, mode.name().toLowerCase(Locale.ROOT), r.total, r.writers, r.readers, payloadSize, conn,
         readFrom.name().toLowerCase(Locale.ROOT), durationS,
         writeTput, writeMB, percentileMs(r.writeLatNanos, 50), percentileMs(r.writeLatNanos, 99),
         readTput, readMB, percentileMs(r.readLatNanos, 50), percentileMs(r.readLatNanos, 99));
@@ -329,6 +418,7 @@ public final class RaftBench {
       transport = Transport.valueOf(opt(o, "transport", "TCP_TLS").toUpperCase(Locale.ROOT));
       final ConnMode conn = ConnMode.valueOf(opt(o, "conn", "B").toUpperCase(Locale.ROOT));
       final ReadFrom readFrom = ReadFrom.valueOf(opt(o, "read-from", "followers").toUpperCase(Locale.ROOT));
+      final Mode mode = Mode.valueOf(opt(o, "mode", "scaling").toUpperCase(Locale.ROOT));
       final double readRatio = Double.parseDouble(opt(o, "read-ratio", "0.7"));
       final int payloadSize = parseSize(opt(o, "payload", "64"));
       final int requests = Integer.parseInt(opt(o, "requests", "1000"));
@@ -336,10 +426,15 @@ public final class RaftBench {
       final String csvPath = o.get("csv");
       final int[] range = parseClients(opt(o, "clients", "5:30:5"));
 
-      System.out.printf("RaftBench: transport=%s conn=%s read-from=%s read-ratio=%.2f "
-              + "payload=%dB requests/client=%d warmup=%d totals=%s%n",
-          transport, conn, readFrom.name().toLowerCase(Locale.ROOT), readRatio,
-          payloadSize, requests, warmup, Arrays.toString(clientCounts(range)));
+      // rywrites has no writer/reader split, so read-ratio is irrelevant there.
+      final String modeSpecific = (mode == Mode.RYWRITES)
+          ? "read=own-writes-from-follower"
+          : String.format(Locale.ROOT, "read-from=%s read-ratio=%.2f",
+              readFrom.name().toLowerCase(Locale.ROOT), readRatio);
+      System.out.printf("RaftBench: transport=%s mode=%s conn=%s %s "
+              + "payload=%dB clients/workers=%s requests=%d warmup=%d%n",
+          transport, mode.name().toLowerCase(Locale.ROOT), conn, modeSpecific,
+          payloadSize, Arrays.toString(clientCounts(range)), requests, warmup);
 
       // --- discover leader + followers ---
       final RaftPeerId leaderId;
@@ -366,11 +461,19 @@ public final class RaftBench {
 
       // --- sweep the total client count, split into readers/writers ---
       for (final int total : clientCounts(range)) {
-        final int readers = Math.max(1, (int) Math.round(total * readRatio));
-        final int writers = Math.max(1, total - readers);
-        final Result r = runBench(total, writers, readers, payloadSize, requests, warmup,
-            conn, readFrom, leaderId, followers);
-        final String row = csvRow(payloadSize, conn, readFrom, r);
+        final Result r;
+        final ReadFrom rowReadFrom;
+        if (mode == Mode.RYWRITES) {
+          r = runBenchRywrites(total, payloadSize, requests, warmup, conn, followers);
+          rowReadFrom = ReadFrom.FOLLOWERS;   // reads always come from a follower in rywrites
+        } else {
+          final int readers = Math.max(1, (int) Math.round(total * readRatio));
+          final int writers = Math.max(1, total - readers);
+          r = runBench(total, writers, readers, payloadSize, requests, warmup,
+              conn, readFrom, leaderId, followers);
+          rowReadFrom = readFrom;
+        }
+        final String row = csvRow(mode, payloadSize, conn, rowReadFrom, r);
         System.out.println(row);
         if (csv != null) {
           csv.println(row);
@@ -385,9 +488,9 @@ public final class RaftBench {
     } catch (Throwable e) {
       e.printStackTrace();
       System.err.println();
-      System.err.println("Usage: RaftBench --transport {TCP_TLS|QUIC} --clients FROM:TO:STEP "
-          + "--read-ratio R --read-from {leader|followers} --payload SIZE --requests N "
-          + "--conn {A|B} [--warmup W] [--csv FILE]");
+      System.err.println("Usage: RaftBench --transport {TCP_TLS|QUIC} --mode {scaling|rywrites} "
+          + "--clients FROM:TO:STEP --read-ratio R --read-from {leader|followers} "
+          + "--payload SIZE --requests N --conn {A|B} [--warmup W] [--csv FILE]");
       Runtime.getRuntime().halt(1);
     }
   }

@@ -47,7 +47,9 @@ import java.io.ObjectOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -87,6 +89,11 @@ public class CounterStateMachine extends BaseStateMachine {
 
   private final SimpleStateMachineStorage storage = new SimpleStateMachineStorage();
   private final AtomicInteger counter = new AtomicInteger(0);
+
+  /** Real data written per client (keyed by the 4-byte client/worker id in the INCREMENT payload),
+   *  so a read-your-writes GET returns the ACTUAL bytes that were written (not a dummy payload).
+   *  Not part of the snapshot — fine for short benchmark runs. */
+  private final Map<Integer, ByteString> clientData = new ConcurrentHashMap<>();
 
   private final TimeDuration simulatedSlowness;
 
@@ -236,15 +243,19 @@ public class CounterStateMachine extends BaseStateMachine {
     if (!CounterCommand.GET.matches(content)) {
       return JavaUtils.completeExceptionally(new IllegalArgumentException("Invalid Command: " + content));
     }
-    // "GET" + 4-byte size (benchmark) => return a zero-filled payload of that size (download).
-    // Plain "GET" (CounterClient) => return the counter value, as before.
     final int prefixLen = CounterCommand.GET.getMessage().getContent().size();
-    if (content.size() >= prefixLen + Integer.BYTES) {
-      final int size = content.substring(prefixLen, prefixLen + Integer.BYTES)
+    // Benchmark read-your-writes: "GET" + workerId(4B) + size(4B) => return the REAL bytes stored for
+    // that worker (or a zero-filled payload of the requested size if nothing applied yet on this peer).
+    if (content.size() >= prefixLen + 2 * Integer.BYTES) {
+      final int workerId = content.substring(prefixLen, prefixLen + Integer.BYTES)
           .asReadOnlyByteBuffer().getInt();
-      return CompletableFuture.completedFuture(
-          Message.valueOf(ByteString.copyFrom(new byte[Math.max(0, size)])));
+      final int size = content.substring(prefixLen + Integer.BYTES, prefixLen + 2 * Integer.BYTES)
+          .asReadOnlyByteBuffer().getInt();
+      final ByteString stored = clientData.get(workerId);
+      return CompletableFuture.completedFuture(Message.valueOf(
+          stored != null ? stored : ByteString.copyFrom(new byte[Math.max(0, size)])));
     }
+    // Plain "GET" (CounterClient) => return the counter value, as before.
     return CompletableFuture.completedFuture(Message.valueOf(toByteString(counter.get())));
   }
 
@@ -274,6 +285,16 @@ public class CounterStateMachine extends BaseStateMachine {
     //increment the counter and update term-index
     final TermIndex termIndex = TermIndex.valueOf(entry);
     final int incremented = incrementCounter(termIndex);
+
+    // Store the written payload keyed by worker id so a follower can serve read-your-writes with the
+    // ACTUAL bytes. INCREMENT payload = "INCREMENT" + workerId(4B) + size(4B) + bytes.
+    final ByteString cmd = entry.getStateMachineLogEntry().getLogData();
+    final int prefixLen = CounterCommand.INCREMENT.getMessage().getContent().size();
+    if (cmd.size() >= prefixLen + Integer.BYTES) {
+      final ByteString body = cmd.substring(prefixLen);   // workerId(4B) + size(4B) + bytes
+      final int workerId = body.substring(0, Integer.BYTES).asReadOnlyByteBuffer().getInt();
+      clientData.put(workerId, body);
+    }
 
     //if leader, log the incremented value and the term-index
     if (LOG.isDebugEnabled() && trx.getServerRole() == RaftPeerRole.LEADER) {
