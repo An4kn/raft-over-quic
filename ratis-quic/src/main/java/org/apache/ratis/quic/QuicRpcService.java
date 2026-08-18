@@ -28,6 +28,8 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder;
@@ -242,9 +244,15 @@ public final class QuicRpcService
       if (tag == TAG_READ_INDEX) {
         p.addLast(new ShadedProtobufDecoder<>(ReadIndexRequestProto.getDefaultInstance()));
         p.addLast(readIndexInboundHandler);
-      } else {
+      } else if (tag == TAG_CLIENT_REQUEST) {
+        // Handled off the event loop; see clientRequestExecutor. Server-to-server streams
+        // fall through to the branch below and keep running on the event loop as before.
         p.addLast(new ShadedProtobufDecoder<>(RaftNettyServerRequestProto.getDefaultInstance()));
-        p.addLast(inboundHandler);
+        p.addLast(clientRequestExecutor, inboundHandler);
+      } else {
+        // AppendEntries / heartbeat / InstallSnapshot / RequestVote — see peerRequestExecutor.
+        p.addLast(new ShadedProtobufDecoder<>(RaftNettyServerRequestProto.getDefaultInstance()));
+        p.addLast(peerRequestExecutor, inboundHandler);
       }
 
       if (LOG.isDebugEnabled()) {
@@ -264,6 +272,44 @@ public final class QuicRpcService
   private final EventLoopGroup group;
   private final InetSocketAddress socketAddress;
   private final MemoizedSupplier<ChannelFuture> channelFuture;
+
+  /**
+   * Runs the blocking client-request handler off the event loop.
+   *
+   * <p>Every QUIC connection of this server is multiplexed over the one UDP socket, and Netty
+   * binds a channel to a single event loop thread — so without this, all client requests, plus
+   * the server-to-server streams queued behind them, would be served strictly one at a time,
+   * each blocking for the length of a consensus round (replication + fsync). TCP needs no such
+   * pool: one connection is one socket is one channel, which Netty already spreads across its
+   * worker group. Only {@link #TAG_CLIENT_REQUEST} uses this; the AppendEntries, heartbeat,
+   * InstallSnapshot, RequestVote and ReadIndex streams keep running on the event loop as before.
+   */
+  private final EventExecutorGroup clientRequestExecutor = new DefaultEventExecutorGroup(
+      Runtime.getRuntime().availableProcessors(),
+      (java.util.concurrent.ThreadFactory) r -> {
+        final Thread t = new Thread(r, "QuicRpcService-clientRequest-");
+        t.setDaemon(true);
+        return t;
+      });
+
+  /**
+   * Runs the server-to-server handler off the event loop, on a pool of its own so a burst of
+   * client requests cannot starve consensus traffic.
+   *
+   * <p>Appending entries blocks on the log write, and on the event loop that stalls every other
+   * stream sharing the UDP socket — which is how the separate AppendEntries/heartbeat streams
+   * lose the very head-of-line freedom they exist to provide. Netty pins each channel to one
+   * executor for its lifetime, so a stream still sees its messages in order; only distinct
+   * streams and distinct peers proceed in parallel. TCP reaches parallelism per connection and
+   * can go no finer, since one connection carries one ordered byte stream.
+   */
+  private final EventExecutorGroup peerRequestExecutor = new DefaultEventExecutorGroup(
+      Runtime.getRuntime().availableProcessors(),
+      (java.util.concurrent.ThreadFactory) r -> {
+        final Thread t = new Thread(r, "QuicRpcService-peerRequest-");
+        t.setDaemon(true);
+        return t;
+      });
 
   // ---- Constructor --------------------------------------------------------
 

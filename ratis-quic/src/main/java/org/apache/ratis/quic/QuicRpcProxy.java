@@ -93,11 +93,33 @@ public class QuicRpcProxy implements Closeable {
    *  over instead of blocking forever. */
   private static final long CONNECT_TIMEOUT_MS = 5000;
 
+  /** Diagnostics only: with -Dratis.quic.connect.timing=true every connect() prints how its
+   *  latency splits between building the quiche codec, binding the UDP socket, the handshake
+   *  itself and opening the first stream. Off by default; no effect on behaviour. */
+  private static final boolean CONNECT_TIMING = Boolean.getBoolean("ratis.quic.connect.timing");
+  private long timingCodecNanos;
+  private long timingBindNanos;
+
   // ---- PeerMap ------------------------------------------------------------
 
   public static class PeerMap extends PeerProxyMap<QuicRpcProxy> {
 
+    /** Every client in this JVM shares one event loop group. Netty's own guidance is that an
+     *  EventLoopGroup is meant to be shared: giving each PeerMap its own means connection mode A
+     *  builds a pool of (2 x cores) threads per request, and shutdownGracefully() then keeps the
+     *  threads of each closed pool alive for its default two-second quiet period — so hundreds of
+     *  threads end up competing for a handful of cores. That hurts QUIC far more than TCP, whose
+     *  handshake runs in the kernel rather than on these threads. */
+    private static final EventLoopGroup SHARED_CLIENT_GROUP = new NioEventLoopGroup(0,
+        (java.util.concurrent.ThreadFactory) r -> {
+          final Thread t = new Thread(r, "QuicRpcProxy-client-");
+          t.setDaemon(true);
+          return t;
+        });
+
     private final EventLoopGroup group;
+    /** False for {@link #SHARED_CLIENT_GROUP}, which outlives any single PeerMap. */
+    private final boolean ownsGroup;
 
     /** Server-server proxy map (creates the 4 Raft-consensus streams per connection). */
     public PeerMap(String name, RaftProperties properties) {
@@ -107,13 +129,17 @@ public class QuicRpcProxy implements Closeable {
     /** @param clientMode true for external client connections, which only need the
      *  single client-request stream (not the 4 server-server streams). */
     public PeerMap(String name, RaftProperties properties, boolean clientMode) {
+      // A server keeps its own group: there is exactly one per server, created at startup.
       this(name, properties, clientMode,
-          new NioEventLoopGroup(0,
-              (java.util.concurrent.ThreadFactory) r ->
-                  new Thread(r, "QuicRpcProxy-" + name + "-")));
+          clientMode ? SHARED_CLIENT_GROUP
+              : new NioEventLoopGroup(0,
+                  (java.util.concurrent.ThreadFactory) r ->
+                      new Thread(r, "QuicRpcProxy-" + name + "-")),
+          !clientMode);
     }
 
-    private PeerMap(String name, RaftProperties properties, boolean clientMode, EventLoopGroup group) {
+    private PeerMap(String name, RaftProperties properties, boolean clientMode,
+        EventLoopGroup group, boolean ownsGroup) {
       super(name, peer -> {
         try {
           final QuicSslContext sslCtx = buildClientSslContext(properties);
@@ -125,12 +151,15 @@ public class QuicRpcProxy implements Closeable {
         }
       });
       this.group = group;
+      this.ownsGroup = ownsGroup;
     }
 
     @Override
     public void close() {
       super.close();
-      group.shutdownGracefully();
+      if (ownsGroup) {
+        group.shutdownGracefully();
+      }
     }
   }
 
@@ -312,6 +341,7 @@ public class QuicRpcProxy implements Closeable {
    *  Called before every connection attempt so that a cancelled/failed prior attempt
    *  cannot leave stale quiche state in the codec. */
   private Channel newUdpChannel() throws InterruptedException {
+    final long t0 = System.nanoTime();
     final ChannelHandler codec = new QuicClientCodecBuilder()
         .sslContext(sslCtx)
         .maxIdleTimeout(0, TimeUnit.MILLISECONDS)
@@ -320,13 +350,19 @@ public class QuicRpcProxy implements Closeable {
         .initialMaxStreamDataBidirectionalRemote(1_000_000)
         .initialMaxStreamsBidirectional(100)
         .build();
-    return new Bootstrap()
+    final long t1 = System.nanoTime();
+    final Channel ch = new Bootstrap()
         .group(group)
         .channel(NioDatagramChannel.class)
         .handler(codec)
         .bind(0)
         .sync()
         .channel();
+    if (CONNECT_TIMING) {
+      timingCodecNanos = t1 - t0;
+      timingBindNanos = System.nanoTime() - t1;
+    }
+    return ch;
   }
 
   /**
@@ -335,6 +371,7 @@ public class QuicRpcProxy implements Closeable {
    * reconnect.
    */
   private Connection connect() throws InterruptedException, IOException {
+    final long connectStartNanos = System.nanoTime();
     final InetSocketAddress remoteAddr = NetUtils.createSocketAddr(peer.getAddress());
 
     // Fresh UDP channel + QUIC codec per attempt — avoids stale quiche state after cancel().
@@ -373,8 +410,16 @@ public class QuicRpcProxy implements Closeable {
     // Server-server connections additionally open the 4 Raft-consensus streams. Opening
     // only what is needed keeps the client handshake light (1 stream vs 5), which matters
     // under concurrency where each openStream().sync() adds serial event-loop work.
+    final long tHandshakeDone = System.nanoTime();
     final StreamHandler crH  = new StreamHandler(true);
     final QuicStreamChannel cr = openStream(qc, QuicRpcService.TAG_CLIENT_REQUEST, crH);
+    if (CONNECT_TIMING) {
+      final double ms = 1_000_000.0;
+      System.err.printf("QUIC-CONNECT codec=%.1fms bind=%.1fms handshake=%.1fms stream=%.1fms%n",
+          timingCodecNanos / ms, timingBindNanos / ms,
+          (tHandshakeDone - connectStartNanos) / ms - (timingCodecNanos + timingBindNanos) / ms,
+          (System.nanoTime() - tHandshakeDone) / ms);
+    }
 
     if (clientMode) {
       return new Connection(qc, null, null, null, null, cr, null, null, null, null, crH);

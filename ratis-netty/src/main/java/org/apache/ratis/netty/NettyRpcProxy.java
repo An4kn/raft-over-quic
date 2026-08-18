@@ -58,18 +58,38 @@ import static org.apache.ratis.proto.netty.NettyProtos.RaftNettyServerReplyProto
 public class NettyRpcProxy implements Closeable {
   public static final Logger LOG = LoggerFactory.getLogger(NettyRpcProxy.class);
   public static class PeerMap extends PeerProxyMap<NettyRpcProxy> {
+    /** One event loop group shared by every client in this JVM, keyed by the epoll setting.
+     *  A group per PeerMap is fine for the usual pattern of a few long-lived clients, but a
+     *  benchmark that builds a client per request then creates (2 x cores) threads per request
+     *  and, because shutdownGracefully() waits out its default two-second quiet period, keeps
+     *  the threads of every closed pool alive meanwhile. QuicRpcProxy.PeerMap is changed the
+     *  same way, so the comparison between the two transports stays symmetric. */
+    private static final Map<Boolean, EventLoopGroup> SHARED_CLIENT_GROUPS = new ConcurrentHashMap<>();
+
     private final EventLoopGroup group;
+    /** False when {@link #group} is shared, since that one outlives any single PeerMap. */
+    private final boolean ownsGroup;
 
     public PeerMap(String name, RaftProperties properties) {
       this(name, properties, null);
     }
 
+    /** Server-side map: one per server, created at startup, so it owns its group. */
     public PeerMap(String name, RaftProperties properties, Parameters parameters) {
-      this(name, properties, parameters, NettyUtils.newEventLoopGroup(name, 0,
-          NettyConfigKeys.Client.useEpoll(properties)));
+      this(name, properties, parameters, false);
     }
 
-    private PeerMap(String name, RaftProperties properties, Parameters parameters, EventLoopGroup group) {
+    public PeerMap(String name, RaftProperties properties, Parameters parameters, boolean clientMode) {
+      this(name, properties, parameters,
+          clientMode
+              ? SHARED_CLIENT_GROUPS.computeIfAbsent(NettyConfigKeys.Client.useEpoll(properties),
+                  epoll -> NettyUtils.newEventLoopGroup("NettyRpcProxy-client", 0, epoll))
+              : NettyUtils.newEventLoopGroup(name, 0, NettyConfigKeys.Client.useEpoll(properties)),
+          !clientMode);
+    }
+
+    private PeerMap(String name, RaftProperties properties, Parameters parameters,
+        EventLoopGroup group, boolean ownsGroup) {
       super(name, peer -> {
         try {
           final SslContext sslContext = NettyUtils.buildSslContextForClient(
@@ -81,12 +101,15 @@ public class NettyRpcProxy implements Closeable {
         }
       });
       this.group = group;
+      this.ownsGroup = ownsGroup;
     }
 
     @Override
     public void close() {
       super.close();
-      group.shutdownGracefully();
+      if (ownsGroup) {
+        group.shutdownGracefully();
+      }
     }
   }
 

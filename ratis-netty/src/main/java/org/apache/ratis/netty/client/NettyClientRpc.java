@@ -53,7 +53,8 @@ public class NettyClientRpc extends RaftClientRpcWithProxy<NettyRpcProxy> {
   }
 
   public NettyClientRpc(ClientId clientId, RaftProperties properties, Parameters parameters) {
-    super(new NettyRpcProxy.PeerMap(clientId.toString(), properties, parameters));
+    // clientMode: share one event loop group across clients instead of creating a pool per client.
+    super(new NettyRpcProxy.PeerMap(clientId.toString(), properties, parameters, true));
     this.clientId = clientId;
     this.requestTimeout = RaftClientConfigKeys.Rpc.requestTimeout(properties);
   }
