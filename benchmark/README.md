@@ -176,20 +176,23 @@ hop_client_leader_ms,hop_server_server_ms,hop_leader_client_ms,candidate_attempt
 
 ---
 
-## 4. Środowisko: klaster DCC Politechniki Poznańskiej (SLURM)
+## 4. Środowisko: klaster z systemem kolejkowym SLURM
 
-- węzeł dostępowy `dcc.cs.put.poznan.pl`, rezerwacje przez SLURM (`salloc`, `squeue`, `scancel`);
-- 16 węzłów `dcc-1..16`, Intel Core i7-12700, 1 GbE: `dcc-1..8` mają 8 GB RAM, `dcc-9..16` 4 GB;
-- w macierzy: 5 serwerów z puli 8 GB, 5 węzłów klienckich z puli 4 GB (jeden proces RaftBench na węzeł);
-- węzły są wyłączone do czasu alokacji (start do ~3 min), po 30 min bezczynności gasną;
-- brak Javy na węzłach: własne JDK 21 w katalogu domowym (NFS), tam też `ratis.jar`
+Skrypty zakładają klaster obliczeniowy, w którym węzły przydziela system SLURM
+(`salloc`, `squeue`, `scancel`), a katalog domowy jest współdzielony przez NFS. Przebieg
+macierzy wymaga 10 węzłów:
+
+- 5 węzłów serwerowych (jednorodny sprzęt, w pomiarach 8 GB RAM) i 5 węzłów klienckich
+  (jeden proces RaftBench na węzeł, w pomiarach 4 GB RAM), sieć 1 GbE;
+- brak Javy na węzłach: własne JDK 21 w katalogu domowym, tam też `ratis.jar`
   i natywna biblioteka quiche dla Linuksa (`netty-quiche-linux.jar`, jar z macOS jej nie zawiera);
 - log Rafta na lokalnym dysku węzła (`/data/...`), nie na NFS;
 - certyfikaty serwera ECDSA P-256 (podpis RSA-4096 kosztował różnie w obu buildach BoringSSL
   i zaniżał wynik QUIC o różnicę bibliotek, nie protokołów).
 
-Rezerwacje od 30 min do 9 h w zależności od rozmiaru przebiegu; `matrix6.sh` tnie macierz
-na kawałki mieszczące się w budżecie rezerwacji.
+Węzły mogą być wyłączone do czasu alokacji (start do kilku minut) i gasnąć po okresie
+bezczynności, dlatego rezerwacja musi objąć cały przebieg: od 30 min do 9 h w zależności od
+rozmiaru, a `matrix6.sh` tnie macierz na kawałki mieszczące się w budżecie rezerwacji.
 
 ---
 
@@ -223,18 +226,18 @@ N=3 TR=quic SINGLE_STREAM=1 bash benchmark/local/run_local_n.sh   # wariant jedn
 N=3 TR=netty HB_THREAD=1    bash benchmark/local/run_local_n.sh   # heartbeaty z osobnego wątku
 ```
 
-### 5.3 Klaster DCC
+### 5.3 Klaster SLURM
 
 ```bash
 # 1. wgraj jar i skrypty (RUNBOOK §3.3)
-scp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar <login>@dcc.cs.put.poznan.pl:ratis.jar
-scp benchmark/lan/{run_matrix.sh,scal.sh,matrix6.sh,alloc.sh,log4j.properties} <login>@dcc.cs.put.poznan.pl:
+scp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar <login>@<węzeł dostępowy>:ratis.jar
+scp benchmark/lan/{run_matrix.sh,scal.sh,matrix6.sh,alloc.sh,log4j.properties} <login>@<węzeł dostępowy>:
 
 # 2. na węźle dostępowym: plan macierzy (nie dotyka klastra)
 REQ_1MB=200 bash ~/matrix6.sh plan
 
 # 3. kawałek po kawałku, każdy we własnej rezerwacji (-t wg planu)
-salloc --no-shell -p dcc -N 10 -t 00:30:00
+salloc --no-shell -p <partycja> -N 10 -t 00:30:00
 bash ~/matrix6.sh 1
 scancel <jobid>
 ```
@@ -242,7 +245,7 @@ scancel <jobid>
 `run_matrix.sh` można też wywołać bezpośrednio, np. jeden układ i jeden ładunek:
 
 ```bash
-SERVER_NODES="dcc-1 dcc-2 dcc-3 dcc-4 dcc-5" CLIENT_NODES="dcc-9 dcc-10 dcc-11 dcc-12 dcc-13" \
+SERVER_NODES="n1 n2 n3 n4 n5" CLIENT_NODES="n9 n10 n11 n12 n13" \
 CLIENT_LAYOUTS='"1 1 1 1 1" "6 6 6 6 6"' SIZES=5 PAYLOADS=1kB CONNS="A B" \
 TRANSPORTS="quic tcp" REQUESTS=1000 REPEATS=1 bash ~/run_matrix.sh
 ```
