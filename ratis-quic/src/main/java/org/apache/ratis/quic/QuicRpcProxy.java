@@ -74,8 +74,13 @@ import static org.apache.ratis.proto.netty.NettyProtos.RaftNettyServerReplyProto
 /**
  * Client-side QUIC proxy for one remote Raft peer.
  *
- * <p>Maintains a single {@link QuicChannel} with four persistent bidirectional
- * streams (AppendEntries, Heartbeat, InstallSnapshot, RequestVote).  When the
+ * <p>Maintains a single {@link QuicChannel} with persistent bidirectional streams.
+ * In the default layout a server-to-server connection carries one stream per message
+ * type (AppendEntries, Heartbeat, InstallSnapshot, RequestVote, plus one for the
+ * remaining requests), so a heartbeat never queues behind a log batch. With
+ * {@link QuicConfigKeys.Server#SINGLE_STREAM_KEY} set, the connection carries one
+ * stream for everything, which restores the ordering of a TCP connection; the layout
+ * is a configuration parameter, the wire protocol is otherwise unchanged.  When the
  * connection drops, {@link #scheduleReconnect()} is called automatically and a
  * new {@link Connection} is established after a short delay — matching the
  * reconnect behaviour that Netty/TCP gets for free from {@code PeerProxyMap}.
@@ -88,10 +93,10 @@ public class QuicRpcProxy implements Closeable {
    *  ChannelOption.CONNECT_TIMEOUT_MILLIS). connect() is synchronous: on failure it
    *  throws and PeerProxyMap recreates the proxy on the next request — no in-proxy
    *  async reconnect / null "reconnecting" state (that combination busy-looped into a
-   *  connection storm under load). Generous (5 s) so concurrent handshakes under load
-   *  do not spuriously fail, yet bounded so a request to a dead leader eventually fails
-   *  over instead of blocking forever. */
-  private static final long CONNECT_TIMEOUT_MS = 5000;
+   *  connection storm under load). 30 s = Netty's default CONNECT_TIMEOUT_MILLIS, so both
+   *  transports wait equally long for a handshake; bounded so a request to a dead leader
+   *  eventually fails over instead of blocking forever. */
+  private static final long CONNECT_TIMEOUT_MS = 30_000;
 
   /** Diagnostics only: with -Dratis.quic.connect.timing=true every connect() prints how its
    *  latency splits between building the quiche codec, binding the UDP socket, the handshake
@@ -203,7 +208,9 @@ public class QuicRpcProxy implements Closeable {
     }
 
     void failAll(Throwable cause) {
-      // Server-server handlers are null on client connections (client mode).
+      // Server-server handlers are null on client connections (client mode). In the
+      // single-stream layout all five slots hold the same handler: the first call clears
+      // its pending map, the remaining ones are no-ops.
       for (StreamHandler h : new StreamHandler[] {appendEntriesHandler, heartbeatHandler,
           installSnapshotHandler, requestVoteHandler, clientRequestHandler}) {
         if (h != null) {
@@ -321,6 +328,11 @@ public class QuicRpcProxy implements Closeable {
    *  that a client never uses. Keeps the client's handshake light (1 stream vs 5). */
   private final boolean clientMode;
 
+  /** Single-stream layout for server-to-server connections
+   *  ({@link QuicConfigKeys.Server#SINGLE_STREAM_KEY}): one persistent stream carries every
+   *  message type. Always false in client mode, which opens a single stream anyway. */
+  private final boolean singleStream;
+
   // ---- Construction -------------------------------------------------------
 
   QuicRpcProxy(RaftPeer peer, RaftProperties properties, EventLoopGroup group,
@@ -330,6 +342,7 @@ public class QuicRpcProxy implements Closeable {
     this.sslCtx         = sslCtx;
     this.group          = group;
     this.clientMode     = clientMode;
+    this.singleStream   = !clientMode && QuicConfigKeys.Server.singleStream(properties);
 
     // Connect synchronously, like NettyRpcProxy. If the peer is unreachable the connect
     // throws and the exception propagates to PeerProxyMap, which recreates the proxy on
@@ -345,9 +358,9 @@ public class QuicRpcProxy implements Closeable {
     final ChannelHandler codec = new QuicClientCodecBuilder()
         .sslContext(sslCtx)
         .maxIdleTimeout(0, TimeUnit.MILLISECONDS)
-        .initialMaxData(10_000_000)
-        .initialMaxStreamDataBidirectionalLocal(1_000_000)
-        .initialMaxStreamDataBidirectionalRemote(1_000_000)
+        .initialMaxData(128 * 1024 * 1024)
+        .initialMaxStreamDataBidirectionalLocal(16 * 1024 * 1024)
+        .initialMaxStreamDataBidirectionalRemote(16 * 1024 * 1024)
         .initialMaxStreamsBidirectional(100)
         .build();
     final long t1 = System.nanoTime();
@@ -366,9 +379,10 @@ public class QuicRpcProxy implements Closeable {
   }
 
   /**
-   * Opens a fresh {@link QuicChannel} to the peer and creates the four
-   * persistent streams on top of it.  Called on first connect and on every
-   * reconnect.
+   * Opens a fresh {@link QuicChannel} to the peer and creates the persistent streams on
+   * top of it: one per message type (default), a single one for everything
+   * ({@link #singleStream}), or just the client-request stream in client mode.
+   * Called on first connect and on every reconnect.
    */
   private Connection connect() throws InterruptedException, IOException {
     final long connectStartNanos = System.nanoTime();
@@ -411,15 +425,20 @@ public class QuicRpcProxy implements Closeable {
     // only what is needed keeps the client handshake light (1 stream vs 5), which matters
     // under concurrency where each openStream().sync() adds serial event-loop work.
     final long tHandshakeDone = System.nanoTime();
+    if (singleStream) {
+      // Single-stream layout: one persistent stream carries every message type, so a
+      // heartbeat waits behind a log batch exactly as on a TCP connection. All five slots
+      // of the Connection alias the same stream and handler, so sendAsync() keeps its
+      // per-type dispatch untouched and every reply lands in the one callId map.
+      final StreamHandler oneH = new StreamHandler(true);
+      final QuicStreamChannel one = openStream(qc, QuicRpcService.TAG_PEER_SINGLE, oneH);
+      printConnectTiming(connectStartNanos, tHandshakeDone);
+      return new Connection(qc, one, one, one, one, one, oneH, oneH, oneH, oneH, oneH);
+    }
+
     final StreamHandler crH  = new StreamHandler(true);
     final QuicStreamChannel cr = openStream(qc, QuicRpcService.TAG_CLIENT_REQUEST, crH);
-    if (CONNECT_TIMING) {
-      final double ms = 1_000_000.0;
-      System.err.printf("QUIC-CONNECT codec=%.1fms bind=%.1fms handshake=%.1fms stream=%.1fms%n",
-          timingCodecNanos / ms, timingBindNanos / ms,
-          (tHandshakeDone - connectStartNanos) / ms - (timingCodecNanos + timingBindNanos) / ms,
-          (System.nanoTime() - tHandshakeDone) / ms);
-    }
+    printConnectTiming(connectStartNanos, tHandshakeDone);
 
     if (clientMode) {
       return new Connection(qc, null, null, null, null, cr, null, null, null, null, crH);
@@ -436,6 +455,19 @@ public class QuicRpcProxy implements Closeable {
     final QuicStreamChannel rv = openStream(qc, QuicRpcService.TAG_REQUEST_VOTE,     rvH);
 
     return new Connection(qc, ae, hb, is, rv, cr, aeH, hbH, isH, rvH, crH);
+  }
+
+  /** {@link #CONNECT_TIMING} only: how the latency of connect() split between the codec,
+   *  the UDP bind, the handshake and the first stream opened on the connection. */
+  private void printConnectTiming(long connectStartNanos, long tHandshakeDone) {
+    if (!CONNECT_TIMING) {
+      return;
+    }
+    final double ms = 1_000_000.0;
+    System.err.printf("QUIC-CONNECT codec=%.1fms bind=%.1fms handshake=%.1fms stream=%.1fms%n",
+        timingCodecNanos / ms, timingBindNanos / ms,
+        (tHandshakeDone - connectStartNanos) / ms - (timingCodecNanos + timingBindNanos) / ms,
+        (System.nanoTime() - tHandshakeDone) / ms);
   }
 
   // ---- Stream helpers -----------------------------------------------------
