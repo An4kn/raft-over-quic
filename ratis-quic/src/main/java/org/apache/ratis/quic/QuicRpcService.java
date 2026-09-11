@@ -290,16 +290,15 @@ public final class QuicRpcService
   /** Gniazda 2..N, zbindowane w startImpl(), zamykane w closeImpl(). */
   private final List<Channel> extraChannels = new ArrayList<>();
 
-  // TYMCZASOWE (eksperyment 2026-08-27): -Dratis.quic.single.pool=true laczy pule
-  // clientRequest i peerRequest w jedna, 2x rdzenie — tyle co workerGroup w Netty.
-  // Domyslnie false = zachowanie dotychczasowe. DO USUNIECIA po pomiarach.
+  // Opcja eksperymentalna: -Dratis.quic.single.pool=true laczy pule clientRequest
+  // i peerRequest w jedna, 2x rdzenie — tyle co workerGroup w Netty.
+  // Domyslnie false = dwie osobne pule (uklad uzyty w pomiarach).
   private static final boolean SINGLE_POOL = Boolean.getBoolean("ratis.quic.single.pool");
 
-  // TYMCZASOWE (eksperyment 2026-08-27): -Dratis.quic.sockets=N binduje N gniazd UDP na tym
-  // samym porcie z SO_REUSEPORT, kazde z wlasnym kodekiem i wlasnym watkiem petli — inaczej
-  // caly transport (syscalle, krypto quiche, kodeki) siedzi na jednym watku, bo jedno gniazdo
-  // = jeden kanal = jeden event loop. Domyslnie 1 = zachowanie dotychczasowe.
-  // DO USUNIECIA po pomiarach.
+  // Opcja eksperymentalna: -Dratis.quic.sockets=N binduje N gniazd UDP na tym samym porcie
+  // z SO_REUSEPORT, kazde z wlasnym kodekiem i wlasnym watkiem petli — inaczej caly transport
+  // (syscalle, krypto quiche, kodeki) siedzi na jednym watku, bo jedno gniazdo = jeden kanal
+  // = jeden event loop. Domyslnie 1 = jedno gniazdo (uklad uzyty w pomiarach).
   private static final int SOCKETS = Math.max(1, Integer.getInteger("ratis.quic.sockets", 1));
 
   /**

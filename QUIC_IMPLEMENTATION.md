@@ -187,15 +187,31 @@ Metoda `handle()` to wielki `switch` po typie żądania — deleguje do odpowied
 
 To jest serce implementacji — zarządza połączeniem do **jednego konkretnego peer serwera**.
 
-### Klasa Connection — 4 trwałe strumienie
+### Klasa Connection — 5 trwałych strumieni
 
 ```
 QuicChannel (jedno połączenie UDP)
 ├── appendEntriesStream   (TAG 0x00) — replikacja logów
 ├── heartbeatStream       (TAG 0x01) — keep-alive lidera
 ├── installSnapshotStream (TAG 0x02) — transfer snapshotów
-└── requestVoteStream     (TAG 0x03) — głosowanie w elekcji
+├── requestVoteStream     (TAG 0x03) — głosowanie w elekcji
+└── clientRequestStream   (TAG 0x04) — pozostałe żądania (klienckie, grupowe, konfiguracyjne)
 ```
+
+Wszystkie pięć strumieni otwierane jest raz, w `connect()`, i żyje tak długo jak połączenie.
+Połączenie klienta zewnętrznego (`clientMode`) otwiera tylko `clientRequestStream`; pozostałe
+cztery pola klasy `Connection` są wtedy puste. Jedynym strumieniem otwieranym per żądanie
+pozostaje `TAG_READ_INDEX` (0x05) w `readIndexAsync()`.
+
+**Parametr `raft.quic.server.single-stream`** (domyślnie `false`) przełącza układ strumieni
+połączenia serwer-serwer. Przy `true` `connect()` otwiera **jeden** trwały strumień
+(`TAG_PEER_SINGLE`, `0x06`) i wszystkie pięć pól klasy `Connection` wskazuje na ten sam
+strumień i ten sam `StreamHandler`; `sendAsync()` nie zmienia się, a wszystkie typy komunikatów
+idą jedną uporządkowaną sekwencją, tak jak jednym połączeniem TCP (heartbeat czeka za dużą
+porcją logów). Służy jako punkt odniesienia w benchmarku: ten sam stos QUIC, inny tylko układ
+strumieni. Klientów zewnętrznych nie dotyczy (zawsze jeden strumień). W `CounterServer`
+włącza go flaga `--single-stream` (razem z `--quic`); serwer loguje wybrany układ przy starcie
+(`server-to-server stream layout: ...`).
 
 Każdy strumień ma przypisany `StreamHandler` — obiekt trzymający mapę oczekujących żądań
 (`pending: Map<callId, CompletableFuture>`).
@@ -223,7 +239,8 @@ public CompletableFuture<RaftNettyServerReplyProto> sendAsync(RaftNettyServerReq
             stream = conn.requestVoteStream;
             // ...
         default:
-            return sendOnNewStream(proto); // ← żądania klienta = nowy efemeryczny strumień
+            stream  = conn.clientRequestStream; // ← żądania klienta i pozostałe: wspólny trwały strumień
+            handler = conn.clientRequestHandler;
     }
     return handler.send(stream, proto);
 }
@@ -315,19 +332,18 @@ private QuicStreamChannel openStream(QuicChannel qc, byte tag, StreamHandler han
 
 **Plik:** `ratis-quic/src/main/java/org/apache/ratis/quic/client/QuicClientRpc.java`
 
-Używany przez aplikacje zewnętrzne (np. `CounterClient`). Każde żądanie aplikacji trafia
-przez `QuicRpcProxy.sendOnNewStream()` — **otwierany jest nowy, efemeryczny strumień QUIC**
-z tagiem `TAG_CLIENT_REQUEST (0x04)`, który jest zamykany po otrzymaniu odpowiedzi.
+Używany przez aplikacje zewnętrzne (np. `CounterClient`). Proxy klienta (`clientMode = true`)
+otwiera przy połączeniu **jeden trwały strumień** z tagiem `TAG_CLIENT_REQUEST (0x04)` i wszystkie
+żądania aplikacji idą tym samym strumieniem, multipleksowane po `callId` w mapie `pending`
+handlera. To ten sam model co jeden reużywany kanał w `NettyRpcProxy`.
 
 ```
 CounterClient.increment()
     → QuicClientRpc.sendRequestAsync()
         → QuicRpcProxy.sendAsync()
-            → sendOnNewStream()           ← nowy strumień per żądanie
-                → otwarcie QuicStreamChannel z TAG 0x04
+            → conn.clientRequestStream    ← wspólny strumień połączenia (TAG 0x04)
                 → wysłanie RaftClientRequestProto
-                → odebranie RaftClientReplyProto
-                → zamknięcie strumienia
+                → odebranie RaftClientReplyProto (dopasowanie po callId)
 ```
 
 Klient ma timeout zaimplementowany przez `TimeoutExecutor` — jeśli odpowiedź nie przyjdzie
@@ -352,8 +368,9 @@ Bajty 1+: Protobuf varint32-framed messages
 | `TAG_HEARTBEAT`        | `0x01`  | peer → peer   | `AppendEntriesRequest` (pusty)    | trwały           |
 | `TAG_INSTALL_SNAPSHOT` | `0x02`  | peer → peer   | `InstallSnapshotRequest`          | trwały           |
 | `TAG_REQUEST_VOTE`     | `0x03`  | peer → peer   | `RequestVoteRequest`              | trwały           |
-| `TAG_CLIENT_REQUEST`   | `0x04`  | klient → peer | dowolny `RaftNettyServerRequest`  | efemeryczny      |
+| `TAG_CLIENT_REQUEST`   | `0x04`  | klient → peer, peer → peer | pozostałe `RaftNettyServerRequest` (klienckie, grupowe, konfiguracyjne) | trwały |
 | `TAG_READ_INDEX`       | `0x05`  | peer → peer   | `ReadIndexRequest`                | efemeryczny      |
+| `TAG_PEER_SINGLE`      | `0x06`  | peer → peer   | każdy typ serwer-serwer (układ jednostrumieniowy, `raft.quic.server.single-stream=true`) | trwały |
 
 **Strumień trwały** — żyje przez cały czas życia połączenia, wiele żądań po nim.
 **Strumień efemeryczny** — otwierany per-żądanie, zamykany po odebraniu odpowiedzi.
@@ -420,50 +437,50 @@ się do `org.apache.ratis.thirdparty.io.netty`) napisano `ShadedProtobufDecoder`
 
 ## 9. Mechanizm reconnect
 
-Netty/TCP ma wbudowany reconnect przez `PeerProxyMap` — przy utracie TCP połączenia tworzony
-jest nowy `NettyRpcProxy`. QUIC musi to obsłużyć inaczej, bo strumienie i połączenia QUIC
-mają własny cykl życia.
+Odtwarzanie połączenia działa w QUIC dokładnie tak samo jak w Netty/TCP: zajmuje się nim
+`PeerProxyMap`, a `QuicRpcProxy` nie ma żadnej własnej logiki ponawiania. Wcześniejsza wersja
+miała asynchroniczny `scheduleReconnect()` z flagą `reconnecting` i stanem `null` w
+`connectionRef`; pod obciążeniem ta kombinacja wpadała w pętlę i burzę połączeń, więc została
+usunięta.
 
-### Kiedy reconnect jest wyzwalany
+### Co się dzieje przy zerwaniu
 
-`StreamHandler.channelInactive()` wywoływane jest gdy jeden ze strumieni QUIC staje się
-nieaktywny (np. serwer zamknął połączenie, timeout, utrata pakietów). To wyzwala `scheduleReconnect()`.
-
-### Ochrona przed wielokrotnymi reconnectami
-
-Cztery strumienie mogą stać się nieaktywne prawie jednocześnie. Flaga atomowa
-`AtomicBoolean reconnecting` gwarantuje, że tylko jeden wywołuje faktyczny reconnect:
+1. `StreamHandler.channelInactive()` (strumień zamknięty przez serwer, timeout, utrata
+   połączenia) kończy wszystkie żądania w locie wyjątkiem
+   `AlreadyClosedException("Stream to <peer> is inactive")`, analogicznie do
+   `NettyRpcProxy.failOutstandingRequests()`.
+2. `AlreadyClosedException` jest wyjątkiem ponawialnym, więc `PeerProxyMap` po stronie
+   wołającego usuwa proxy dla tego peera.
+3. Przy następnym żądaniu do tego peera `PeerProxyMap` tworzy nowe `QuicRpcProxy`. Jego
+   konstruktor wykonuje **synchroniczne** `connect()`: nowe gniazdo UDP z własnym kodekiem
+   quiche (`newUdpChannel()`), pełny handshake QUIC i otwarcie trwałych strumieni.
 
 ```java
-private void scheduleReconnect() {
-    if (closed) return;
-    if (!reconnecting.compareAndSet(false, true)) return;  // już ktoś reconnectuje
-
-    Connection old = connectionRef.getAndSet(null);  // atomowo usuń stare połączenie
-    if (old != null) {
-        old.failAll(new AlreadyClosedException("Reconnecting to " + peer));
-        old.quicChannel.close();
-    }
-    group.schedule(this::doReconnect, 200, MILLISECONDS);  // czekaj 200ms
+QuicRpcProxy(RaftPeer peer, ...) {
+    // ...
+    connectionRef.set(connect());   // synchronicznie, jak w NettyRpcProxy
 }
 
-private void doReconnect() {
-    if (closed) { reconnecting.set(false); return; }
-    try {
-        Connection conn = connect();  // nowe QuicChannel + 4 nowe strumienie
-        connectionRef.set(conn);
-        reconnecting.set(false);
-    } catch (Exception e) {
-        group.schedule(this::doReconnect, 1_000, MILLISECONDS);  // retry co 1s
-    }
+@Override
+public void channelInactive(ChannelHandlerContext ctx) {
+    failAll(new AlreadyClosedException("Stream to " + peer + " is inactive"));
+    super.channelInactive(ctx);
 }
 ```
 
-### UDP socket jest reużywany
+### Limit czasu połączenia
 
-`udpChannel` (gniazdo UDP) jest tworzony raz w konstruktorze i **nie jest zamykany podczas
-reconnectu** — tylko `QuicChannel` (logiczne połączenie QUIC) jest zastępowane. To eliminuje
-kosztowne `bind()` przy każdym reconneccie.
+Pojedyncza próba `connect()` jest ograniczona stałą `CONNECT_TIMEOUT_MS = 30 000`, równą
+domyślnemu `CONNECT_TIMEOUT_MILLIS` Netty, więc oba transporty czekają na handshake równie
+długo. Jeśli peer jest nieosiągalny, `connect()` rzuca wyjątek, który propaguje się do
+`PeerProxyMap`; żądanie do martwego lidera kończy się więc błędem i failoverem po stronie
+klienta, a nie blokowaniem w nieskończoność.
+
+### Gniazdo UDP nie jest reużywane
+
+Każda próba połączenia dostaje świeże gniazdo UDP i świeży egzemplarz kodeku
+(`newUdpChannel()`), żeby przerwana lub nieudana poprzednia próba nie zostawiła w kodeku
+zastałego stanu quiche. Koszt ponownego `bind()` jest pomijalny wobec kosztu handshake'u.
 
 ---
 
@@ -489,6 +506,13 @@ raft.quic.client.tls.key=/etc/ratis/client.key
 ```
 Klient prezentuje własny certyfikat — serwer go weryfikuje.
 
+### Układ strumieni serwer-serwer
+```properties
+raft.quic.server.single-stream=false   # domyślnie: jeden strumień na typ komunikatu
+raft.quic.server.single-stream=true    # jeden strumień na połączenie (wszystkie typy razem)
+```
+Parametr benchmarkowy, opisany w sekcji 5 (klasa `Connection`). `CounterServer`: `--quic --single-stream`.
+
 ### ALPN
 Negocjacja protokołu aplikacji: `"ratis-quic"` (stała `QuicConfigKeys.ALPN`).
 To pozwala serwerowi odrzucić przypadkowych klientów.
@@ -503,11 +527,11 @@ To pozwala serwerowi odrzucić przypadkowych klientów.
 |---------------------------|----------------------------------------------|---------------------------------------------------|
 | Protokół transportu       | TCP (stream)                                 | QUIC nad UDP                                      |
 | Połączenie per peer        | 1 TCP socket                                 | 1 UDP socket → 1 QuicChannel                      |
-| Strumienie per połączenie  | 1 (wszystko razem)                           | 4 trwałe + efemeryczne per żądanie                |
+| Strumienie per połączenie  | 1 (wszystko razem)                           | 5 trwałych + efemeryczny ReadIndex (1, gdy `single-stream=true`) |
 | Head-of-line blocking      | TAK — duże AE blokuje HB                    | NIE — każdy typ na osobnym strumieniu             |
 | TLS                        | opcjonalne (SslContext dodawany do pipeline) | obowiązkowe (wbudowane w QUIC handshake)          |
 | Handshake RTT              | TCP 3-way + TLS 1.3 = 2 RTT minimum         | QUIC: 1 RTT (lub 0-RTT przy reconnect)           |
-| Reconnect                  | PeerProxyMap tworzy nowy NettyRpcProxy       | scheduleReconnect() po 200ms, reużywa UDP socket  |
+| Reconnect                  | PeerProxyMap tworzy nowy NettyRpcProxy       | PeerProxyMap tworzy nowy QuicRpcProxy (nowe gniazdo UDP + handshake) |
 | Identyfikacja połączenia   | (src_ip, src_port, dst_ip, dst_port)         | Connection ID — przeżywa zmianę IP               |
 
 ### Struktura klas
@@ -619,21 +643,21 @@ CounterClient                                       QuicRpcService
      │                                                    │
      │  QuicClientRpc.sendRequestAsync(req)               │
      ↓                                                    │
-  QuicRpcProxy.sendOnNewStream()                          │
-  → otwórz nowy QuicStreamChannel                         │
-  → wyślij TAG_CLIENT_REQUEST (0x04)                      │
+  QuicRpcProxy.sendAsync()                                │
+  → conn.clientRequestStream (trwały, TAG 0x04 wysłany    │
+    raz przy otwarciu strumienia w connect())             │
      │                                                    │
-     │──── [0x04][len][RaftClientRequestProto] ──────────►│
+     │──── [len][RaftClientRequestProto] ────────────────►│
      │                                                    │
-     │                       StreamTypeDecoder czyta 0x04
+     │                       StreamTypeDecoder przeczytał 0x04 przy otwarciu
      │                       → pipeline z RaftNettyServerRequestProto
      │                       InboundHandler → server.submitClientRequest()
      │                       ctx.writeAndFlush(reply)
-     │                       (strumień zamykany po reply)
      │                                                    │
      │◄─── [len][RaftNettyServerReplyProto] ──────────────│
      │                                                    │
-  ch.close()  ← efemeryczny strumień zamknięty           │
+  StreamHandler dopasowuje odpowiedź po callId;           │
+  strumień pozostaje otwarty na kolejne żądania           │
 ```
 
 ---
@@ -704,7 +728,6 @@ java -cp ratis-examples/target/ratis-examples-3.3.0-SNAPSHOT.jar \
 
 
 # 1 przesttesiowanie netty jak dziala
-  ![alt text](image.png)
 to sie pojawia tylko przez to ze mamy doczynienia z tym ze nei wsyztswekei zainicjowalismy
 # 2 quic przetetsowanie
 szybsze polaczoenei , migreacja polaczenia oraz wielestrumineiu
@@ -727,3 +750,7 @@ docker compose -f docker/docker-compose.yml exec client \
   java -cp /app/ratis-examples.jar \
   org.apache.ratis.examples.counter.client.CounterClient 5 IO
 docker compose -f docker/docker-compose.yml exec n1 iptables -F
+
+
+
+

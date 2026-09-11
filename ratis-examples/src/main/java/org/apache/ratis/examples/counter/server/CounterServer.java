@@ -111,7 +111,7 @@ public final class CounterServer implements Closeable {
       extraProperties.accept(properties);
     }
 
-    // TYMCZASOWE, DO EKSPERYMENTU - USUNAC PO ZAKONCZENIU POMIAROW.
+    // Opcja eksperymentalna (-Dratis.appender.buffer).
     // Ile bajtow wpisow logu lider pakuje w JEDNO AppendEntries. Domyslna wartosc jest
     // identyczna z domyslna Ratisa (4MB), wiec bez podania -Dratis.appender.buffer nic sie
     // nie zmienia. Sluzy do sprawdzenia, czy zapasc przy 1MB bierze sie stad, ze przesylka
