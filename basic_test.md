@@ -42,4 +42,3 @@ QUIC server started on /0.0.0.0:10024
 To potwierdza że transport jest QUIC a nie TCP.
 
 Problem 1 — readIndexAsync rzuca wyjątek na followerze i jest gdzieś łapany cicho
-Problem 2 — po restarcie serwera QuicRpcProxy nie odbudowuje połączenia (brak reconnect logic)

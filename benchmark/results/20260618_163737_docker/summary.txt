@@ -1,0 +1,28 @@
+Benchmark: QUIC vs Netty — Thu Jun 18 16:37:37 CEST 2026
+Środowisko: docker
+
+Transport: QUIC
+
+[1/4] Baseline (5 inkrementów, bez awarii)
+  Pomiar 1: TIMEOUTs
+  Pomiar 2: TIMEOUTs
+  Pomiar 3: TIMEOUTs
+
+[2/4] Awaria followera — nowy klient
+  Lider: n0  |  DROP followera: n1
+
+[3/4] Awaria lidera — nowy klient
+  DROP lidera: n0
+
+[4/4] Awaria lidera — klient już połączony
+  Startuje klient (20 inkrementów), po 1s DROP lidera: n2
+
+PODSUMOWANIE
+Test                                   | QUIC         | Netty       
+--------------------------------------------------------------------
+Baseline (mediana 3 x 5 inkrementów)  | FAIL         | n/a         
+Awaria followera / nowy klient         | TIMEOUT      | n/a         
+Awaria lidera / nowy klient            | TIMEOUT      | n/a         
+Awaria lidera / klient połączony     | TIMEOUT      | n/a         
+
+Wyniki zapisane w: /Users/tomek/projekt/raft-over-quic/benchmark/results/20260618_163737_docker

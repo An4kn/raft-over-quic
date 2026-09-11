@@ -12,6 +12,38 @@
   limitations under the License. See accompanying LICENSE file.
 -->
 
+# Raft over QUIC: fork Apache Ratis z transportem QUIC
+
+To repozytorium jest kopią rozwojową [Apache Ratis](https://ratis.apache.org/) (3.3.0-SNAPSHOT)
+przygotowaną na potrzeby pracy magisterskiej na Politechnice Poznańskiej. Dodaje do biblioteki
+wymienny transport RPC oparty na protokole QUIC i porównuje go ilościowo z transportem
+referencyjnym TCP z TLS 1.3 na klastrze Raft. Poniżej tej sekcji znajduje się niezmienione
+README projektu Apache Ratis.
+
+**Zmiany względem Apache Ratis:**
+
+- `ratis-quic`: nowy moduł transportu QUIC (`QuicFactory`, `QuicRpcService`, `QuicRpcProxy`,
+  `QuicClientRpc`) na bibliotece netty-incubator-codec-quic (quiche + BoringSSL). Połączenie
+  serwer-serwer prowadzi pięć trwałych strumieni, po jednym na typ komunikatu, więc heartbeat
+  nie czeka w kolejce za replikacją logów; opcjonalny układ jednostrumieniowy
+  (`raft.quic.server.single-stream`) służy jako punkt odniesienia.
+- `ratis-netty`: TLS 1.3 na ścieżce RPC transportu referencyjnego oraz domyślnie wyłączona opcja
+  osobnego wątku heartbeatów (`--hb-thread`, rejestr w [HB-THREAD-CHANGES.md](HB-THREAD-CHANGES.md)).
+- `ratis-server`: diagnostyka opóźnień AppendEntries po stronie lidera (HOPSTAT) i przerw między
+  heartbeatami po stronie followera (FGAP).
+- `ratis-examples`: `CounterServer` z flagami `--quic`, `--single-stream`, `--hb-thread`,
+  `--rpc-timeout`, `--no-prevote`; sonda PING/PONG w `CounterStateMachine`; narzędzie pomiarowe
+  `RaftBench` (zapis przez konsensus + odczyt z followera w pętli zamkniętej).
+- `benchmark/`: skrypty macierzy pomiarowej na klastrze SLURM (`run_matrix.sh`, `matrix6.sh`,
+  `scal.sh`), piloty stabilności przywództwa i wyniki (`benchmark/results/`).
+- `docker/`: klaster w kontenerach do testów funkcjonalnych obu transportów.
+
+Opis eksperymentu, metryk i procedury pomiarowej: [benchmark/README.md](benchmark/README.md).
+Opis implementacji modułu QUIC: [QUIC_IMPLEMENTATION.md](QUIC_IMPLEMENTATION.md).
+Stan kodu odpowiadający wersji pracy oznaczono tagiem `praca-mgr-2026-09`.
+
+---
+
 # Apache Ratis
 *[Apache Ratis]* is a Java library that implements the Raft protocol [1],
 where an extended version of the Raft paper is available at <https://raft.github.io/raft.pdf>.
